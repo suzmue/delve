@@ -75,6 +75,8 @@ type Server struct {
 
 	// noDebugProcess is set for the noDebug launch process.
 	noDebugProcess *exec.Cmd
+	// logPoints tracks which breakpoint ids are logPoints
+	logPoints map[int]string
 }
 
 // launchAttachArgs captures arguments from launch/attach request that
@@ -122,6 +124,7 @@ func NewServer(config *service.Config) *Server {
 		stackFrameHandles: newHandlesMap(),
 		variableHandles:   newVariablesHandlesMap(),
 		args:              defaultArgs,
+		logPoints:         make(map[int]string),
 	}
 }
 
@@ -433,6 +436,7 @@ func (s *Server) onInitializeRequest(request *dap.InitializeRequest) {
 	response.Body.SupportsReadMemoryRequest = false
 	response.Body.SupportsDisassembleRequest = false
 	response.Body.SupportsCancelRequest = false
+	response.Body.SupportsLogPoints = true
 	s.send(response)
 }
 
@@ -709,6 +713,9 @@ func (s *Server) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
 			response.Body.Breakpoints[i].Id = got.ID
 			response.Body.Breakpoints[i].Line = got.Line
 			response.Body.Breakpoints[i].Source = dap.Source{Name: request.Arguments.Source.Name, Path: request.Arguments.Source.Path}
+			if len(want.LogMessage) > 0 {
+				s.logPoints[got.ID] = want.LogMessage
+			}
 		}
 	}
 	s.send(response)
@@ -1519,6 +1526,14 @@ func (s *Server) doCommand(command string) {
 			stopped.Body.Reason = "breakpoint"
 		}
 		if state.CurrentThread.Breakpoint != nil {
+			// If we are stopped at a logpoint, we want to send an OutputEvent
+			// and continue running.
+			if msg, ok := s.logPoints[state.CurrentThread.Breakpoint.ID]; ok {
+				s.handleLogPoint(msg)
+				s.doCommand("continue")
+				return
+			}
+
 			switch state.CurrentThread.Breakpoint.Name {
 			case proc.FatalThrow:
 				stopped.Body.Reason = "fatal error"
@@ -1554,4 +1569,82 @@ func (s *Server) doCommand(command string) {
 				Category: "stderr",
 			}})
 	}
+}
+
+type logMessageInput struct {
+	val  string
+	expr bool
+}
+
+func (s *Server) handleLogPoint(msg string) {
+	output := ""
+	parts := parseLogPoint(msg)
+	for _, part := range parts {
+		val := part.val
+		if part.expr {
+			var err error
+			val, err = s.evaluate(part.val)
+			if err != nil {
+				s.send(&dap.OutputEvent{
+					Event: *newEvent("output"),
+					Body: dap.OutputEventBody{
+						Output:   err.Error(),
+						Category: "stderr",
+					},
+				})
+				return
+			}
+		}
+		output += val
+	}
+	output += "\n"
+	s.send(&dap.OutputEvent{
+		Event: *newEvent("output"),
+		Body: dap.OutputEventBody{
+			Output:   output,
+			Category: "console",
+		},
+	})
+}
+
+func (s *Server) evaluate(expr string) (string, error) {
+	// Default to the topmost stack frame of the current goroutine in case
+	// no frame is specified (e.g. when stopped on entry or no call stack frame is expanded)
+	goid, frame := -1, 0
+
+	exprVar, err := s.debugger.EvalVariableInScope(goid, frame, 0, expr, DefaultLoadConfig)
+	if err != nil {
+
+		return "", fmt.Errorf("Unable to evaluate expression: %s", err.Error())
+	}
+	// TODO(polina): as far as I can tell, evaluateName is ignored by vscode for expression variables.
+	// Should it be skipped alltogether for all levels?
+	exprVal, _ := s.convertVariable(exprVar, fmt.Sprintf("(%s)", expr))
+	return exprVal, nil
+}
+
+func parseLogPoint(msg string) []logMessageInput {
+	var inputs = []logMessageInput{}
+	for i, c := range msg {
+		if i == 0 {
+			isExpr := false
+			val := string(c)
+			if c == '{' {
+				isExpr = true
+				val = ""
+			}
+			inputs = append(inputs, logMessageInput{val: string(val), expr: isExpr})
+			continue
+		}
+		if c == '{' {
+			inputs = append(inputs, logMessageInput{val: "", expr: true})
+			continue
+		}
+		if c == '}' {
+			inputs = append(inputs, logMessageInput{val: "", expr: false})
+			continue
+		}
+		inputs[len(inputs)-1].val += string(c)
+	}
+	return inputs
 }
