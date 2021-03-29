@@ -11,6 +11,7 @@ package dap
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/constant"
 	"io"
@@ -1245,10 +1246,6 @@ func (s *Server) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr s
 // -- print {expression} - return the result as a string like from dlv cli
 func (s *Server) onEvaluateRequest(request *dap.EvaluateRequest) {
 	showErrorToUser := request.Arguments.Context != "watch"
-	if s.debugger == nil {
-		s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", "debugger is nil", showErrorToUser)
-		return
-	}
 	// Default to the topmost stack frame of the current goroutine in case
 	// no frame is specified (e.g. when stopped on entry or no call stack frame is expanded)
 	goid, frame := -1, 0
@@ -1257,98 +1254,15 @@ func (s *Server) onEvaluateRequest(request *dap.EvaluateRequest) {
 		frame = sf.(stackFrame).frameIndex
 	}
 
+	evaluated, err := s.evaluate(request, request.Arguments.Expression, goid, frame)
+	if err != nil {
+		s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", err.Error(), showErrorToUser)
+		return
+	}
 	response := &dap.EvaluateResponse{Response: *newResponse(request.Request)}
-	isCall, err := regexp.MatchString(`^\s*call\s+\S+`, request.Arguments.Expression)
-	if err == nil && isCall { // call {expression}
-		// This call might be evaluated in the context of the frame that is not topmost
-		// if the editor is set to view the variables for one of the parent frames.
-		// If the call expression refers to any of these variables, unlike regular
-		// expressions, it will evaluate them in the context of the topmost frame,
-		// and the user will get an unexpected result or an unexpected symbol error.
-		// We prevent this but disallowing any frames other than topmost.
-		if frame > 0 {
-			s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", "call is only supported with topmost stack frame", showErrorToUser)
-			return
-		}
-		stateBeforeCall, err := s.debugger.State( /*nowait*/ true)
-		if err != nil {
-			s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", err.Error(), showErrorToUser)
-			return
-		}
-		state, err := s.debugger.Command(&api.DebuggerCommand{
-			Name:                 api.Call,
-			ReturnInfoLoadConfig: api.LoadConfigFromProc(&DefaultLoadConfig),
-			Expr:                 strings.Replace(request.Arguments.Expression, "call ", "", 1),
-			UnsafeCall:           false,
-			GoroutineID:          goid,
-		}, nil)
-		if _, isexited := err.(proc.ErrProcessExited); isexited || err == nil && state.Exited {
-			e := &dap.TerminatedEvent{Event: *newEvent("terminated")}
-			s.send(e)
-			return
-		}
-		if err != nil {
-			s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", err.Error(), showErrorToUser)
-			return
-		}
-		// After the call is done, the goroutine where we injected the call should
-		// return to the original stopped line with return values. However,
-		// it is not guaranteed to be selected due to the possibility of the
-		// of simultaenous breakpoints. Therefore, we check all threads.
-		var retVars []*proc.Variable
-		for _, t := range state.Threads {
-			if t.GoroutineID == stateBeforeCall.SelectedGoroutine.ID &&
-				t.Line == stateBeforeCall.SelectedGoroutine.CurrentLoc.Line && t.CallReturn {
-				// The call completed. Get the return values.
-				retVars, err = s.debugger.FindThreadReturnValues(t.ID, DefaultLoadConfig)
-				if err != nil {
-					s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", err.Error(), showErrorToUser)
-					return
-				}
-				break
-			}
-		}
-		if retVars == nil {
-			// The call got interrupted by a stop (e.g. breakpoint in injected
-			// function call or in another goroutine)
-			s.resetHandlesForStop()
-			stopped := &dap.StoppedEvent{Event: *newEvent("stopped")}
-			stopped.Body.AllThreadsStopped = true
-			if state.SelectedGoroutine != nil {
-				stopped.Body.ThreadId = state.SelectedGoroutine.ID
-			}
-			stopped.Body.Reason = s.debugger.StopReason().String()
-			s.send(stopped)
-			// TODO(polina): once this is asynchronous, we could wait to reply until the user
-			// continues, call ends, original stop point is hit and return values are available.
-			s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", "call stopped", showErrorToUser)
-			return
-		}
-		// The call completed and we can reply with its return values (if any)
-		if len(retVars) > 0 {
-			// Package one or more return values in a single scope-like nameless variable
-			// that preserves their names.
-			retVarsAsVar := &proc.Variable{Children: slicePtrVarToSliceVar(retVars)}
-			// As a shortcut also express the return values as a single string.
-			retVarsAsStr := ""
-			for _, v := range retVars {
-				retVarsAsStr += s.convertVariableToString(v) + ", "
-			}
-			response.Body = dap.EvaluateResponseBody{
-				Result:             strings.TrimRight(retVarsAsStr, ", "),
-				VariablesReference: s.variableHandles.create(&fullyQualifiedVariable{retVarsAsVar, "", false /*not a scope*/}),
-			}
-		}
-	} else { // {expression}
-		exprVar, err := s.debugger.EvalVariableInScope(goid, frame, 0, request.Arguments.Expression, DefaultLoadConfig)
-		if err != nil {
-			s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", err.Error(), showErrorToUser)
-			return
-		}
-		// TODO(polina): as far as I can tell, evaluateName is ignored by vscode for expression variables.
-		// Should it be skipped alltogether for all levels?
-		exprVal, exprRef := s.convertVariable(exprVar, fmt.Sprintf("(%s)", request.Arguments.Expression))
-		response.Body = dap.EvaluateResponseBody{Result: exprVal, VariablesReference: exprRef}
+	response.Body = dap.EvaluateResponseBody{
+		Result:             evaluated.Result,
+		VariablesReference: evaluated.VariablesReference,
 	}
 	s.send(response)
 }
@@ -1571,9 +1485,103 @@ func (s *Server) doCommand(command string) {
 	}
 }
 
-type logMessageInput struct {
-	val  string
-	expr bool
+type evaluatedExpr struct {
+	Result             string
+	VariablesReference int
+}
+
+func (s *Server) evaluate(expression string, goid, frame int) (*evaluatedExpr, error) {
+	if s.debugger == nil {
+		return nil, errors.New("debugger is nil")
+	}
+	var result *evaluatedExpr
+	isCall, err := regexp.MatchString(`^\s*call\s+\S+`, expression)
+	if err == nil && isCall { // call {expression}
+		// This call might be evaluated in the context of the frame that is not topmost
+		// if the editor is set to view the variables for one of the parent frames.
+		// If the call expression refers to any of these variables, unlike regular
+		// expressions, it will evaluate them in the context of the topmost frame,
+		// and the user will get an unexpected result or an unexpected symbol error.
+		// We prevent this but disallowing any frames other than topmost.
+		if frame > 0 {
+			return nil, errors.New("call is only supported with topmost stack frame")
+		}
+		stateBeforeCall, err := s.debugger.State( /*nowait*/ true)
+		if err != nil {
+			return nil, err
+		}
+		state, err := s.debugger.Command(&api.DebuggerCommand{
+			Name:                 api.Call,
+			ReturnInfoLoadConfig: api.LoadConfigFromProc(&DefaultLoadConfig),
+			Expr:                 strings.Replace(expression, "call ", "", 1),
+			UnsafeCall:           false,
+			GoroutineID:          goid,
+		}, nil)
+		if _, isexited := err.(proc.ErrProcessExited); isexited || err == nil && state.Exited {
+			e := &dap.TerminatedEvent{Event: *newEvent("terminated")}
+			s.send(e)
+			return nil, errors.New("target has terminated")
+		}
+		if err != nil {
+			return nil, err
+		}
+		// After the call is done, the goroutine where we injected the call should
+		// return to the original stopped line with return values. However,
+		// it is not guaranteed to be selected due to the possibility of the
+		// of simultaenous breakpoints. Therefore, we check all threads.
+		var retVars []*proc.Variable
+		for _, t := range state.Threads {
+			if t.GoroutineID == stateBeforeCall.SelectedGoroutine.ID &&
+				t.Line == stateBeforeCall.SelectedGoroutine.CurrentLoc.Line && t.CallReturn {
+				// The call completed. Get the return values.
+				retVars, err = s.debugger.FindThreadReturnValues(t.ID, DefaultLoadConfig)
+				if err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+		if retVars == nil {
+			// The call got interrupted by a stop (e.g. breakpoint in injected
+			// function call or in another goroutine)
+			s.resetHandlesForStop()
+			stopped := &dap.StoppedEvent{Event: *newEvent("stopped")}
+			stopped.Body.AllThreadsStopped = true
+			if state.SelectedGoroutine != nil {
+				stopped.Body.ThreadId = state.SelectedGoroutine.ID
+			}
+			stopped.Body.Reason = s.debugger.StopReason().String()
+			s.send(stopped)
+			// TODO(polina): once this is asynchronous, we could wait to reply until the user
+			// continues, call ends, original stop point is hit and return values are available.
+			return nil, errors.New("call stopped")
+		}
+		// The call completed and we can reply with its return values (if any)
+		if len(retVars) > 0 {
+			// Package one or more return values in a single scope-like nameless variable
+			// that preserves their names.
+			retVarsAsVar := &proc.Variable{Children: slicePtrVarToSliceVar(retVars)}
+			// As a shortcut also express the return values as a single string.
+			retVarsAsStr := ""
+			for _, v := range retVars {
+				retVarsAsStr += s.convertVariableToString(v) + ", "
+			}
+			result = &evaluatedExpr{
+				Result:             strings.TrimRight(retVarsAsStr, ", "),
+				VariablesReference: s.variableHandles.create(&fullyQualifiedVariable{retVarsAsVar, "", false /*not a scope*/}),
+			}
+		}
+	} else { // {expression}
+		exprVar, err := s.debugger.EvalVariableInScope(goid, frame, 0, expression, DefaultLoadConfig)
+		if err != nil {
+			return nil, err
+		}
+		// TODO(polina): as far as I can tell, evaluateName is ignored by vscode for expression variables.
+		// Should it be skipped alltogether for all levels?
+		exprVal, exprRef := s.convertVariable(exprVar, fmt.Sprintf("(%s)", expression))
+		result = &evaluatedExpr{Result: exprVal, VariablesReference: exprRef}
+	}
+	return result, nil
 }
 
 func (s *Server) handleLogPoint(msg string) {
@@ -1582,8 +1590,7 @@ func (s *Server) handleLogPoint(msg string) {
 	for _, part := range parts {
 		val := part.val
 		if part.expr {
-			var err error
-			val, err = s.evaluate(part.val)
+			result, err := s.evaluate(part.val, -1, 0)
 			if err != nil {
 				s.send(&dap.OutputEvent{
 					Event: *newEvent("output"),
@@ -1594,6 +1601,7 @@ func (s *Server) handleLogPoint(msg string) {
 				})
 				return
 			}
+			val = result.Result
 		}
 		output += val
 	}
@@ -1607,42 +1615,33 @@ func (s *Server) handleLogPoint(msg string) {
 	})
 }
 
-func (s *Server) evaluate(expr string) (string, error) {
-	// Default to the topmost stack frame of the current goroutine in case
-	// no frame is specified (e.g. when stopped on entry or no call stack frame is expanded)
-	goid, frame := -1, 0
-
-	exprVar, err := s.debugger.EvalVariableInScope(goid, frame, 0, expr, DefaultLoadConfig)
-	if err != nil {
-
-		return "", fmt.Errorf("Unable to evaluate expression: %s", err.Error())
-	}
-	// TODO(polina): as far as I can tell, evaluateName is ignored by vscode for expression variables.
-	// Should it be skipped alltogether for all levels?
-	exprVal, _ := s.convertVariable(exprVar, fmt.Sprintf("(%s)", expr))
-	return exprVal, nil
+type logMessageInput struct {
+	val  string
+	expr bool
 }
 
 func parseLogPoint(msg string) []logMessageInput {
-	var inputs = []logMessageInput{}
-	for i, c := range msg {
-		if i == 0 {
-			isExpr := false
-			val := string(c)
-			if c == '{' {
-				isExpr = true
-				val = ""
-			}
-			inputs = append(inputs, logMessageInput{val: string(val), expr: isExpr})
-			continue
-		}
+	var inputs = []logMessageInput{
+		{
+			val:  "",
+			expr: false,
+		},
+	}
+	braceCount := 0
+	for _, c := range msg {
 		if c == '{' {
-			inputs = append(inputs, logMessageInput{val: "", expr: true})
-			continue
+			braceCount++
+			if braceCount == 1 {
+				inputs = append(inputs, logMessageInput{val: "", expr: true})
+				continue
+			}
 		}
 		if c == '}' {
-			inputs = append(inputs, logMessageInput{val: "", expr: false})
-			continue
+			braceCount--
+			if braceCount == 0 {
+				inputs = append(inputs, logMessageInput{val: "", expr: false})
+				continue
+			}
 		}
 		inputs[len(inputs)-1].val += string(c)
 	}
