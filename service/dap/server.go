@@ -1449,8 +1449,14 @@ func (s *Server) doCommand(command string) {
 			// and continue running.
 			if msg, ok := s.logPoints[state.CurrentThread.Breakpoint.ID]; ok {
 				s.handleLogPoint(msg)
-				s.doCommand("continue")
-				return
+				if command == api.Continue || ((command == api.Step || command == api.StepOut || command == api.Next) && state.NextInProgress) {
+					s.doCommand(api.Continue)
+					return
+				}
+				// If the logpoint interrupted a step command,
+				// the internal breakpoint has already been cleared
+				// so we need to send a stopped event and not continue.
+				stopped.Body.Reason = "logpoint"
 			}
 
 			switch state.CurrentThread.Breakpoint.Name {
