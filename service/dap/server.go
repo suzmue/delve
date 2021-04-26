@@ -425,6 +425,7 @@ func (s *Server) onInitializeRequest(request *dap.InitializeRequest) {
 	response.Body.SupportsConditionalBreakpoints = true
 	response.Body.SupportsDelayedStackTraceLoading = true
 	response.Body.SupportTerminateDebuggee = true
+	response.Body.SupportsLogPoints = true
 	// TODO(polina): support this to match vscode-go functionality
 	response.Body.SupportsSetVariable = false
 	// TODO(polina): support these requests in addition to vscode-go feature parity
@@ -437,7 +438,6 @@ func (s *Server) onInitializeRequest(request *dap.InitializeRequest) {
 	response.Body.SupportsReadMemoryRequest = false
 	response.Body.SupportsDisassembleRequest = false
 	response.Body.SupportsCancelRequest = false
-	response.Body.SupportsLogPoints = true
 	s.send(response)
 }
 
@@ -701,13 +701,15 @@ func (s *Server) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
 			return
 		}
 	}
+	// Clear existing log messages.
+	s.logPoints = map[int]string{}
 
 	// Set all requested breakpoints.
 	response := &dap.SetBreakpointsResponse{Response: *newResponse(request.Request)}
 	response.Body.Breakpoints = make([]dap.Breakpoint, len(request.Arguments.Breakpoints))
 	for i, want := range request.Arguments.Breakpoints {
 		got, err := s.debugger.CreateBreakpoint(
-			&api.Breakpoint{File: request.Arguments.Source.Path, Line: want.Line, Cond: want.Condition})
+			&api.Breakpoint{File: request.Arguments.Source.Path, Line: want.Line, Cond: want.Condition, Tracepoint: len(want.LogMessage) > 0})
 		response.Body.Breakpoints[i].Verified = (err == nil)
 		if err != nil {
 			response.Body.Breakpoints[i].Line = want.Line
@@ -1447,9 +1449,11 @@ func (s *Server) doCommand(command string) {
 		if state.CurrentThread.Breakpoint != nil {
 			// If we are stopped at a logpoint, we want to send an OutputEvent
 			// and continue running.
-			if msg, ok := s.logPoints[state.CurrentThread.Breakpoint.ID]; ok {
-				s.handleLogPoint(msg)
-				if command == api.Continue || ((command == api.Step || command == api.StepOut || command == api.Next) && state.NextInProgress) {
+			if state.CurrentThread.Breakpoint.Tracepoint {
+				if msg, ok := s.logPoints[state.CurrentThread.Breakpoint.ID]; ok {
+					s.handleLogPoint(msg)
+				}
+				if command == api.Continue || state.NextInProgress {
 					s.doCommand(api.Continue)
 					return
 				}

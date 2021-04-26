@@ -191,7 +191,7 @@ func (dbp *Target) Continue() error {
 			if err != nil {
 				return err
 			}
-			if onNextGoroutine {
+			if onNextGoroutine && !curbp.Tracepoint && !curbp.TraceReturn {
 				err := dbp.ClearInternalBreakpoints()
 				if err != nil {
 					return err
