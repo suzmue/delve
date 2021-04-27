@@ -1448,7 +1448,10 @@ func (s *Server) onEvaluateRequest(request *dap.EvaluateRequest) {
 	}
 
 	response := &dap.EvaluateResponse{Response: *newResponse(request.Request)}
-	exprVal, exprRef, err := s.evaluate(goid, frame, request.Arguments.Expression)
+	exprVal, exprRef, terminated, err := s.evaluate(goid, frame, request.Arguments.Expression)
+	if terminated {
+		return
+	}
 	if err != nil {
 		s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", err.Error(), showErrorToUser)
 		return
@@ -1460,15 +1463,15 @@ func (s *Server) onEvaluateRequest(request *dap.EvaluateRequest) {
 	s.send(response)
 }
 
-func (s *Server) evaluate(goid int, frame int, expression string) (result string, variablesReference int, err error) {
+func (s *Server) evaluate(goid int, frame int, expression string) (result string, variablesReference int, terminated bool, err error) {
 	isCall, err := regexp.MatchString(`^\s*call\s+\S+`, expression)
 	if err == nil && isCall {
 		if frame > 0 {
-			return "", -1, errors.New("call is only supported with topmost stack frame")
+			return "", -1, false, errors.New("call is only supported with topmost stack frame")
 		}
 		stateBeforeCall, err := s.debugger.State(true)
 		if err != nil {
-			return "", -1, err
+			return "", -1, false, err
 		}
 		state, err := s.debugger.Command(&api.DebuggerCommand{
 			Name:                 api.Call,
@@ -1480,10 +1483,10 @@ func (s *Server) evaluate(goid int, frame int, expression string) (result string
 		if _, isexited := err.(proc.ErrProcessExited); isexited || err == nil && state.Exited {
 			e := &dap.TerminatedEvent{Event: *newEvent("terminated")}
 			s.send(e)
-			return "", -1, errors.New("program terminated")
+			return "", -1, false, errors.New("program terminated")
 		}
 		if err != nil {
-			return "", -1, err
+			return "", -1, false, err
 		}
 
 		var retVars []*proc.Variable
@@ -1493,7 +1496,7 @@ func (s *Server) evaluate(goid int, frame int, expression string) (result string
 
 				retVars, err = s.debugger.FindThreadReturnValues(t.ID, DefaultLoadConfig)
 				if err != nil {
-					return "", -1, err
+					return "", -1, false, err
 				}
 				break
 			}
@@ -1507,7 +1510,7 @@ func (s *Server) evaluate(goid int, frame int, expression string) (result string
 			stopped.Body.Reason = s.debugger.StopReason().String()
 			s.send(stopped)
 
-			return "", -1, errors.New("call stopped")
+			return "", -1, true, nil
 		}
 
 		if len(retVars) > 0 {
@@ -1524,12 +1527,12 @@ func (s *Server) evaluate(goid int, frame int, expression string) (result string
 	} else {
 		exprVar, err := s.debugger.EvalVariableInScope(goid, frame, 0, expression, DefaultLoadConfig)
 		if err != nil {
-			return "", -1, err
+			return "", -1, false, err
 		}
 
 		result, variablesReference = s.convertVariable(exprVar, fmt.Sprintf("(%s)", expression))
 	}
-	return result, variablesReference, nil
+	return result, variablesReference, false, nil
 }
 
 // onTerminateRequest sends a not-yet-implemented error response.
@@ -1758,11 +1761,6 @@ func (s *Server) doCommand(command string) {
 	}
 }
 
-type evaluatedExpr struct {
-	Result             string
-	VariablesReference int
-}
-
 func (s *Server) handleLogPoint(msg string) {
 	// TODO(suzmue): Do we want to store the result of parsing this
 	// log point?
@@ -1771,7 +1769,10 @@ func (s *Server) handleLogPoint(msg string) {
 	for _, part := range parts {
 		val := part.val
 		if part.expr {
-			exprVal, _, err := s.evaluate(-1, 0, val)
+			exprVal, _, terminated, err := s.evaluate(-1, 0, val)
+			if terminated {
+				return
+			}
 			if err != nil {
 				s.send(&dap.OutputEvent{
 					Event: *newEvent("output"),
