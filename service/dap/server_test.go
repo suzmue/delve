@@ -1754,7 +1754,7 @@ func TestLogpoints(t *testing.T) {
 				// Stop at line 23
 				execute: func() {
 					bps := []int{6, 25, 27, 16}
-					logMessages := map[int]string{6: "in callme i={i}!", 16: "in callme2 nBytes*2={nBytes*2}!"}
+					logMessages := map[int]string{6: "in callme i={i}!", 16: "in callme2 nBytes*2={nBytes*2}! calling callme(1)={call callme(1)}"}
 					client.SetLogpointsRequest(fixture.Source, bps, logMessages)
 					client.ExpectSetBreakpointsResponse(t)
 
@@ -1782,17 +1782,26 @@ func TestLogpoints(t *testing.T) {
 					}
 					handleStop(t, client, 1, "main.main", 27)
 
+					// Clear all breakpoints except for in callme2. If there is a breakpoint encountered
+					// during a 'call' evaluation, this will halt the program.
+					bps = []int{16}
+					logMessages = map[int]string{16: "in callme2 nBytes*2={nBytes*2}! calling callme(1)={call callme(1)}"}
+					client.SetLogpointsRequest(fixture.Source, bps, logMessages)
+					client.ExpectSetBreakpointsResponse(t)
+
 					client.NextRequest(1)
 					client.ExpectNextResponse(t)
 
 					oe := client.ExpectOutputEvent(t)
-					if oe.Body.Category != "console" || oe.Body.Output != "in callme2 nBytes*2=20!\n" {
-						t.Errorf("got output event = %#v, \nwant Category=\"console\" Output=\"in callme2 nBytes*2=20!\n\"", oe)
+					if oe.Body.Category != "console" || oe.Body.Output != "in callme2 nBytes*2=20! calling callme(1)=\n" {
+						t.Errorf("got output event = %#v, \nwant Category=\"console\" Output=\"in callme2 nBytes*2=20! calling callme(1)=\n\"", oe)
 					}
 
+					// This breakpoint interrupted a next request, so the program will have halted at
+					// the breakpoint line.
 					se = client.ExpectStoppedEvent(t)
 					if se.Body.Reason != "logpoint" || se.Body.ThreadId != 1 {
-						t.Errorf("got stopped event = %#v, \nwant Reason=\"step\" ThreadId=1", se)
+						t.Errorf("got stopped event = %#v, \nwant Reason=\"logpoint\" ThreadId=1", se)
 					}
 					handleStop(t, client, 1, "main.callme2", 16)
 				},
