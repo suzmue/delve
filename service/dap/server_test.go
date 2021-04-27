@@ -1739,6 +1739,68 @@ func TestSetBreakpoint(t *testing.T) {
 	})
 }
 
+// TestLogpoints executes to a breakpoint and tests logpoints
+// send OutputEvents and do not halt program execution.
+func TestLogpoints(t *testing.T) {
+	runTest(t, "callme", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{23},
+			[]onBreakpoint{{
+				// Stop at line 23
+				execute: func() {
+					bps := []int{6, 25, 27, 16}
+					logMessages := map[int]string{6: "in callme i={i}!", 16: "in callme2 nBytes*2={nBytes*2}!"}
+					client.SetLogpointsRequest(fixture.Source, bps, logMessages)
+					client.ExpectSetBreakpointsResponse(t)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+
+					for i := 0; i < 5; i++ {
+						se := client.ExpectStoppedEvent(t)
+						if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
+							t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
+						}
+						handleStop(t, client, 1, "main.main", 25)
+
+						client.ContinueRequest(1)
+						client.ExpectContinueResponse(t)
+
+						oe := client.ExpectOutputEvent(t)
+						if oe.Body.Category != "console" || oe.Body.Output != fmt.Sprintf("in callme i=%d!\n", i) {
+							t.Errorf("got output event = %#v, \nwant Category=\"console\" Output=\"in callme i=%d!\n\"", oe, i)
+						}
+					}
+					se := client.ExpectStoppedEvent(t)
+					if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
+						t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
+					}
+					handleStop(t, client, 1, "main.main", 27)
+
+					client.NextRequest(1)
+					client.ExpectNextResponse(t)
+
+					oe := client.ExpectOutputEvent(t)
+					if oe.Body.Category != "console" || oe.Body.Output != "in callme2 nBytes*2=20!\n" {
+						t.Errorf("got output event = %#v, \nwant Category=\"console\" Output=\"in callme2 nBytes*2=20!\n\"", oe)
+					}
+
+					se = client.ExpectStoppedEvent(t)
+					if se.Body.Reason != "logpoint" || se.Body.ThreadId != 1 {
+						t.Errorf("got stopped event = %#v, \nwant Reason=\"step\" ThreadId=1", se)
+					}
+					handleStop(t, client, 1, "main.callme2", 16)
+				},
+				disconnect: true,
+			}})
+	})
+}
+
 // TestLaunchSubstitutePath sets a breakpoint using a path
 // that does not exist and expects the substitutePath attribute
 // in the launch configuration to take care of the mapping.

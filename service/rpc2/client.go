@@ -124,9 +124,7 @@ func (c *RPCClient) continueDir(cmd string) <-chan *api.DebuggerState {
 					istracepoint = istracepoint && (state.Threads[i].Breakpoint.Tracepoint || state.Threads[i].Breakpoint.TraceReturn)
 				}
 			}
-			if istracepoint {
-				cmd = "continue"
-			}
+
 			if !isbreakpoint || !istracepoint {
 				close(ch)
 				return

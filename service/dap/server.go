@@ -1867,12 +1867,14 @@ func (s *Server) evaluate(expression string, goid, frame int) (*evaluatedExpr, e
 }
 
 func (s *Server) handleLogPoint(msg string) {
+	// TODO(suzmue): Do we want to store the result of parsing this
+	// log point?
 	output := ""
 	parts := parseLogPoint(msg)
 	for _, part := range parts {
 		val := part.val
 		if part.expr {
-			result, err := s.evaluate(part.val, -1, 0)
+			exprVar, err := s.debugger.EvalVariableInScope(-1, 0, 0, part.val, DefaultLoadConfig)
 			if err != nil {
 				s.send(&dap.OutputEvent{
 					Event: *newEvent("output"),
@@ -1883,7 +1885,8 @@ func (s *Server) handleLogPoint(msg string) {
 				})
 				return
 			}
-			val = result.Result
+			exprVal, _ := s.convertVariable(exprVar, fmt.Sprintf("(%s)", val))
+			val = exprVal
 		}
 		output += val
 	}
