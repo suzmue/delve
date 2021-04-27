@@ -1447,8 +1447,12 @@ func (s *Server) onEvaluateRequest(request *dap.EvaluateRequest) {
 		frame = sf.(stackFrame).frameIndex
 	}
 
+<<<<<<< HEAD
 	response := &dap.EvaluateResponse{Response: *newResponse(request.Request)}
 	exprVal, exprRef, err := s.evaluate(goid, frame, request.Arguments.Expression)
+=======
+	evaluated, err := s.evaluate(request.Arguments.Expression, goid, frame)
+>>>>>>> 58e84012e8716ae7036e64279d55783803127639
 	if err != nil {
 		s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", err.Error(), showErrorToUser)
 		return
