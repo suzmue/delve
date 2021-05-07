@@ -1856,6 +1856,25 @@ func TestSetBreakpoint(t *testing.T) {
 					// Set at a line without a statement
 					client.SetBreakpointsRequest(fixture.Source, []int{1000})
 					expectSetBreakpointsResponse([]Breakpoint{{1000, "", false, "could not find statement"}}) // all cleared, none set
+
+					// Set a log message at the next line.
+					client.SetLogpointsRequest(fixture.Source, []int{8, 9}, map[int]string{9: "hello i={i}"})
+					expectSetBreakpointsResponse([]Breakpoint{{8, fixture.Source, true, ""}, {9, fixture.Source, true, ""}})
+
+					// Continue for one more loop iteration
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+
+					oe := client.ExpectOutputEvent(t)
+					if oe.Body.Category != "console" || oe.Body.Output != "hello i=5\n" {
+						t.Errorf("got output event = %#v, \nwant Category=\"console\" Output=\"hello i=5\n\"", oe)
+					}
+
+					client.ExpectStoppedEvent(t)
+					handleStop(t, client, 1, "main.loop", 8)
+					client.VariablesRequest(1001) // Locals
+					locals = client.ExpectVariablesResponse(t)
+					expectVarExact(t, locals, 0, "i", "i", "5", noChildren) // i == 5
 				},
 				// The program has an infinite loop, so we must kill it by disconnecting.
 				disconnect: true,
