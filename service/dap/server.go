@@ -124,6 +124,7 @@ type Server struct {
 // launchAttachArgs captures arguments from launch/attach request that
 // impact handling of subsequent requests.
 type launchAttachArgs struct {
+	showRuntime bool
 	// stopOnEntry is set to automatically stop the debugee after start.
 	stopOnEntry bool
 	// stackTraceDepth is the maximum length of the returned list of stack frames.
@@ -140,6 +141,7 @@ type launchAttachArgs struct {
 
 // defaultArgs borrows the defaults for the arguments from the original vscode-go adapter.
 var defaultArgs = launchAttachArgs{
+	showRuntime:                  true,
 	stopOnEntry:                  false,
 	stackTraceDepth:              50,
 	showGlobalVariables:          false,
@@ -182,6 +184,10 @@ func NewServer(config *service.Config) *Server {
 // If user-specified options are provided via Launch/AttachRequest,
 // we override the defaults for optional args.
 func (s *Server) setLaunchAttachArgs(request dap.LaunchAttachRequest) error {
+	showRuntime, ok := request.GetArguments()["showRuntime"].(bool)
+	if ok {
+		s.args.showRuntime = showRuntime
+	}
 	stop, ok := request.GetArguments()["stopOnEntry"].(bool)
 	if ok {
 		s.args.stopOnEntry = stop
@@ -1079,8 +1085,8 @@ func (s *Server) onThreadsRequest(request *dap.ThreadsRequest) {
 		return
 	}
 
-	threads := make([]dap.Thread, len(gs))
-	if len(threads) == 0 {
+	var threads []dap.Thread
+	if len(gs) == 0 {
 		// Depending on the debug session stage, goroutines information
 		// might not be available. However, the DAP spec states that
 		// "even if a debug adapter does not support multiple threads,
@@ -1096,7 +1102,7 @@ func (s *Server) onThreadsRequest(request *dap.ThreadsRequest) {
 		s.debugger.LockTarget()
 		defer s.debugger.UnlockTarget()
 
-		for i, g := range gs {
+		for _, g := range gs {
 			selected := ""
 			if state.SelectedGoroutine != nil && g.ID == state.SelectedGoroutine.ID {
 				selected = "* "
@@ -1108,8 +1114,19 @@ func (s *Server) onThreadsRequest(request *dap.ThreadsRequest) {
 			// File name and line number are communicated via `stackTrace`
 			// so no need to include them here.
 			loc := g.UserCurrent()
-			threads[i].Name = fmt.Sprintf("%s[Go %d] %s%s", selected, g.ID, fnName(&loc), thread)
-			threads[i].Id = g.ID
+			if !s.args.showRuntime && (loc.Fn == nil || loc.Fn.PackageName() == "runtime") {
+				continue
+			}
+			threads = append(threads, dap.Thread{
+				Id:   g.ID,
+				Name: fmt.Sprintf("%s[Go %d] %s%s", selected, g.ID, fnName(&loc), thread),
+			})
+		}
+		if state.SelectedGoroutine == nil {
+			threads = append(threads, dap.Thread{
+				Id:   -1,
+				Name: "Current",
+			})
 		}
 	}
 	response := &dap.ThreadsResponse{
