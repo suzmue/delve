@@ -1866,8 +1866,98 @@ func TestSetBreakpoint(t *testing.T) {
 					// Set at a line without a statement
 					client.SetBreakpointsRequest(fixture.Source, []int{1000})
 					expectSetBreakpointsResponse([]Breakpoint{{1000, "", false, "could not find statement"}}) // all cleared, none set
+
+					// Set a log message at the next line.
+					client.SetLogpointsRequest(fixture.Source, []int{8, 9}, map[int]string{9: "hello i={i}"})
+					expectSetBreakpointsResponse([]Breakpoint{{8, fixture.Source, true, ""}, {9, fixture.Source, true, ""}})
+
+					// Continue for one more loop iteration
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+
+					oe := client.ExpectOutputEvent(t)
+					if oe.Body.Category != "console" || oe.Body.Output != "hello i=5\n" {
+						t.Errorf("got output event = %#v, \nwant Category=\"console\" Output=\"hello i=5\n\"", oe)
+					}
+
+					client.ExpectStoppedEvent(t)
+					handleStop(t, client, 1, "main.loop", 8)
+					client.VariablesRequest(1001) // Locals
+					locals = client.ExpectVariablesResponse(t)
+					expectVarExact(t, locals, 0, "i", "i", "5", noChildren) // i == 5
 				},
 				// The program has an infinite loop, so we must kill it by disconnecting.
+				disconnect: true,
+			}})
+	})
+}
+
+// TestLogpoints executes to a breakpoint and tests logpoints
+// send OutputEvents and do not halt program execution.
+func TestLogpoints(t *testing.T) {
+	runTest(t, "callme", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{23},
+			[]onBreakpoint{{
+				// Stop at line 23
+				execute: func() {
+					bps := []int{6, 25, 27, 16}
+					logMessages := map[int]string{6: "in callme i={i}!", 16: "in callme2 nBytes*2={nBytes*2}! calling callme(1)={call callme(1)}"}
+					client.SetLogpointsRequest(fixture.Source, bps, logMessages)
+					client.ExpectSetBreakpointsResponse(t)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+
+					for i := 0; i < 5; i++ {
+						se := client.ExpectStoppedEvent(t)
+						if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
+							t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
+						}
+						handleStop(t, client, 1, "main.main", 25)
+
+						client.ContinueRequest(1)
+						client.ExpectContinueResponse(t)
+
+						oe := client.ExpectOutputEvent(t)
+						if oe.Body.Category != "console" || oe.Body.Output != fmt.Sprintf("in callme i=%d!\n", i) {
+							t.Errorf("got output event = %#v, \nwant Category=\"console\" Output=\"in callme i=%d!\n\"", oe, i)
+						}
+					}
+					se := client.ExpectStoppedEvent(t)
+					if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
+						t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
+					}
+					handleStop(t, client, 1, "main.main", 27)
+
+					// Clear all breakpoints except for in callme2. If there is a breakpoint encountered
+					// during a 'call' evaluation, this will halt the program.
+					bps = []int{16}
+					logMessages = map[int]string{16: "in callme2 nBytes*2={nBytes*2}! calling callme(1)={call callme(1)}"}
+					client.SetLogpointsRequest(fixture.Source, bps, logMessages)
+					client.ExpectSetBreakpointsResponse(t)
+
+					client.NextRequest(1)
+					client.ExpectNextResponse(t)
+
+					oe := client.ExpectOutputEvent(t)
+					if oe.Body.Category != "console" || oe.Body.Output != "in callme2 nBytes*2=20! calling callme(1)=\n" {
+						t.Errorf("got output event = %#v, \nwant Category=\"console\" Output=\"in callme2 nBytes*2=20! calling callme(1)=\n\"", oe)
+					}
+
+					// This breakpoint interrupted a next request, so the program will have halted at
+					// the breakpoint line.
+					se = client.ExpectStoppedEvent(t)
+					if se.Body.Reason != "logpoint" || se.Body.ThreadId != 1 {
+						t.Errorf("got stopped event = %#v, \nwant Reason=\"logpoint\" ThreadId=1", se)
+					}
+					handleStop(t, client, 1, "main.callme2", 16)
+				},
 				disconnect: true,
 			}})
 	})

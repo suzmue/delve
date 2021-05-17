@@ -100,6 +100,7 @@ func (c *Client) ExpectInitializeResponseAndCapabilities(t *testing.T) *dap.Init
 		SupportsConditionalBreakpoints:   true,
 		SupportsDelayedStackTraceLoading: true,
 		SupportTerminateDebuggee:         true,
+		SupportsLogPoints:                true,
 	}
 	if !reflect.DeepEqual(initResp.Body, wantCapabilities) {
 		t.Errorf("capabilities in initializeResponse: got %+v, want %v", pretty(initResp.Body), pretty(wantCapabilities))
@@ -238,6 +239,51 @@ func (c *Client) SetConditionalBreakpointsRequest(file string, lines []int, cond
 		cond, ok := conditions[l]
 		if ok {
 			request.Arguments.Breakpoints[i].Condition = cond
+		}
+	}
+	c.send(request)
+}
+
+// SetLogpointsRequest sends a 'setBreakpoints' request with logMessages.
+func (c *Client) SetLogpointsRequest(file string, lines []int, logMessages map[int]string) {
+	request := &dap.SetBreakpointsRequest{Request: *c.newRequest("setBreakpoints")}
+	request.Arguments = dap.SetBreakpointsArguments{
+		Source: dap.Source{
+			Name: filepath.Base(file),
+			Path: file,
+		},
+		Breakpoints: make([]dap.SourceBreakpoint, len(lines)),
+	}
+	for i, l := range lines {
+		request.Arguments.Breakpoints[i].Line = l
+		msg, ok := logMessages[l]
+		if ok {
+			request.Arguments.Breakpoints[i].LogMessage = msg
+		}
+	}
+	c.send(request)
+}
+
+// SetConditionalLogpointsRequest sends a 'setBreakpoints' request with conditions and log messages.
+func (c *Client) SetConditionalLogpointsRequest(file string, lines []int, conditions map[int]string, message map[int]string) {
+	request := &dap.SetBreakpointsRequest{Request: *c.newRequest("setBreakpoints")}
+	request.Arguments = dap.SetBreakpointsArguments{
+		Source: dap.Source{
+			Name: filepath.Base(file),
+			Path: file,
+		},
+		Breakpoints: make([]dap.SourceBreakpoint, len(lines)),
+		//sourceModified: false,
+	}
+	for i, l := range lines {
+		request.Arguments.Breakpoints[i].Line = l
+		cond, ok := conditions[l]
+		if ok {
+			request.Arguments.Breakpoints[i].Condition = cond
+		}
+		m, ok := message[l]
+		if ok {
+			request.Arguments.Breakpoints[i].LogMessage = m
 		}
 	}
 	c.send(request)
