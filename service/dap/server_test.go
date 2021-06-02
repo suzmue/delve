@@ -1466,7 +1466,18 @@ func TestScopesRequestsOptimized(t *testing.T) {
 // fully unloaded.
 func TestVariablesLoading(t *testing.T) {
 	runTest(t, "testvariables2", func(client *daptest.Client, fixture protest.Fixture) {
-		runDebugSessionWithBPs(t, client, "launch",
+		runDebugSessionWithBPsArgs(t, client, "launch",
+			// Initialize Args
+			dap.InitializeRequestArguments{
+				AdapterID:                    "go",
+				PathFormat:                   "path",
+				LinesStartAt1:                true,
+				ColumnsStartAt1:              true,
+				SupportsVariableType:         true,
+				SupportsRunInTerminalRequest: true,
+				SupportsVariablePaging:       true, // Set variable paging to true for this test.
+				Locale:                       "en-us",
+			},
 			// Launch
 			func() {
 				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
@@ -1506,15 +1517,10 @@ func TestVariablesLoading(t *testing.T) {
 
 					// Array not fully loaded based on LoadConfig.MaxArrayValues.
 					// Expect to be able to load array by paging.
-					ref := checkVarExactIndexed(t, locals, -1, "longarr", "longarr", "[100]int [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,...+36 more]", "[100]int", hasChildren, 100, 0)
+					ref := checkVarExactIndexed(t, locals, -1, "longarr", "longarr", "[100]int [0,0,0,0,0,0,0,0,0,0,...+90 more]", "[100]int", hasChildren, 100, 0)
 					if ref > 0 {
-						client.VariablesRequest(ref)
-						longarr := client.ExpectVariablesResponse(t)
-						checkChildren(t, longarr, "longarr", 64)
-						checkArrayChildren(t, longarr, "longarr", 0)
-
 						client.IndexedVariablesRequest(ref, 0, 100)
-						longarr = client.ExpectVariablesResponse(t)
+						longarr := client.ExpectVariablesResponse(t)
 						checkChildren(t, longarr, "longarr", 100)
 						checkArrayChildren(t, longarr, "longarr", 0)
 
@@ -1522,20 +1528,14 @@ func TestVariablesLoading(t *testing.T) {
 						longarr = client.ExpectVariablesResponse(t)
 						checkChildren(t, longarr, "longarr", 50)
 						checkArrayChildren(t, longarr, "longarr", 50)
-
 					}
 
 					// Slice not fully loaded based on LoadConfig.MaxArrayValues.
 					// Expect to be able to load slice by paging.
-					ref = checkVarExactIndexed(t, locals, -1, "longslice", "longslice", "[]int len: 100, cap: 100, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,...+36 more]", "[]int", hasChildren, 100, 0)
+					ref = checkVarExactIndexed(t, locals, -1, "longslice", "longslice", "[]int len: 100, cap: 100, [0,0,0,0,0,0,0,0,0,0,...+90 more]", "[]int", hasChildren, 100, 0)
 					if ref > 0 {
-						client.VariablesRequest(ref)
-						longarr := client.ExpectVariablesResponse(t)
-						checkChildren(t, longarr, "longslice", 64)
-						checkArrayChildren(t, longarr, "longslice", 0)
-
 						client.IndexedVariablesRequest(ref, 0, 100)
-						longarr = client.ExpectVariablesResponse(t)
+						longarr := client.ExpectVariablesResponse(t)
 						checkChildren(t, longarr, "longslice", 100)
 						checkArrayChildren(t, longarr, "longslice", 0)
 
@@ -1547,14 +1547,10 @@ func TestVariablesLoading(t *testing.T) {
 
 					// Map not fully loaded based on LoadConfig.MaxArrayValues
 					// Expect to be able to load map by paging.
-					ref = checkVarRegexIndexed(t, locals, -1, "m1", "m1", `map\[string\]main\.astruct \[.+\.\.\.\+2 more\]`, `map\[string\]main\.astruct`, hasChildren, 66, 0)
+					ref = checkVarRegexIndexed(t, locals, -1, "m1", "m1", `map\[string\]main\.astruct \[.+\.\.\.\+56 more\]`, `map\[string\]main\.astruct`, hasChildren, 66, 0)
 					if ref > 0 {
-						client.VariablesRequest(ref)
-						m1 := client.ExpectVariablesResponse(t)
-						checkChildren(t, m1, "m1", 64)
-
 						client.IndexedVariablesRequest(ref, 0, 66)
-						m1 = client.ExpectVariablesResponse(t)
+						m1 := client.ExpectVariablesResponse(t)
 						checkChildren(t, m1, "m1", 66)
 
 						client.IndexedVariablesRequest(ref, 0, 33)
@@ -1653,11 +1649,11 @@ func TestVariablesLoading(t *testing.T) {
 							client.VariablesRequest(ref)
 							tmV := client.ExpectVariablesResponse(t)
 							checkChildren(t, tmV, "tm.v", 1)
-							ref = checkVarRegex(t, tmV, 0, `\[0\]`, `tm\.v\[0\]`, `map\[string\]main\.astruct \[.+\.\.\.\+2 more\]`, `map\[string\]main\.astruct`, hasChildren)
+							ref = checkVarRegexIndexed(t, tmV, 0, `\[0\]`, `tm\.v\[0\]`, `map\[string\]main\.astruct \[.+\.\.\.\+56 more\]`, `map\[string\]main\.astruct`, hasChildren, 66, 0)
 							if ref > 0 {
-								client.VariablesRequest(ref)
+								client.IndexedVariablesRequest(ref, 0, 66)
 								tmV0 := client.ExpectVariablesResponse(t)
-								checkChildren(t, tmV0, "tm.v[0]", 64)
+								checkChildren(t, tmV0, "tm.v[0]", 66)
 							}
 						}
 					}
@@ -1683,11 +1679,11 @@ func TestVariablesLoading(t *testing.T) {
 								tmV := client.ExpectVariablesResponse(t)
 								checkChildren(t, tmV, "tm.v", 1)
 								// TODO(polina): this evaluate name is not usable - it should be empty
-								ref = checkVarRegex(t, tmV, 0, `\[0\]`, `\[0\]`, `map\[string\]main\.astruct \[.+\.\.\.\+2 more\]`, `map\[string\]main\.astruct`, hasChildren)
+								ref = checkVarRegex(t, tmV, 0, `\[0\]`, `\[0\]`, `map\[string\]main\.astruct \[.+\.\.\.\+56 more\]`, `map\[string\]main\.astruct`, hasChildren)
 								if ref > 0 {
-									client.VariablesRequest(ref)
+									client.IndexedVariablesRequest(ref, 0, 66)
 									tmV0 := client.ExpectVariablesResponse(t)
-									checkChildren(t, tmV0, "tm.v[0]", 64)
+									checkChildren(t, tmV0, "tm.v[0]", 66)
 								}
 							}
 						}
@@ -3417,6 +3413,17 @@ func runDebugSessionWithBPs(t *testing.T, client *daptest.Client, cmd string, cm
 	client.InitializeRequest()
 	client.ExpectInitializeResponseAndCapabilities(t)
 
+	runDebugSessionWithBPsHelper(t, client, cmd, cmdRequest, source, breakpoints, onBPs)
+}
+
+func runDebugSessionWithBPsArgs(t *testing.T, client *daptest.Client, cmd string, args dap.InitializeRequestArguments, cmdRequest func(), source string, breakpoints []int, onBPs []onBreakpoint) {
+	client.InitializeRequestWithArgs(args)
+	client.ExpectInitializeResponseAndCapabilities(t)
+
+	runDebugSessionWithBPsHelper(t, client, cmd, cmdRequest, source, breakpoints, onBPs)
+}
+
+func runDebugSessionWithBPsHelper(t *testing.T, client *daptest.Client, cmd string, cmdRequest func(), source string, breakpoints []int, onBPs []onBreakpoint) {
 	cmdRequest()
 	client.ExpectInitializedEvent(t)
 	if cmd == "launch" {

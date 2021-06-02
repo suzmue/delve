@@ -164,7 +164,6 @@ func (c *Client) InitializeRequest() {
 		LinesStartAt1:                true,
 		ColumnsStartAt1:              true,
 		SupportsVariableType:         true,
-		SupportsVariablePaging:       true,
 		SupportsRunInTerminalRequest: true,
 		Locale:                       "en-us",
 	}

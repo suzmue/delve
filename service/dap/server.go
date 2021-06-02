@@ -706,6 +706,10 @@ func (s *Server) setClientCapabilities(args dap.InitializeRequestArguments) {
 	s.clientCapabilities.supportsProgressReporting = args.SupportsProgressReporting
 	s.clientCapabilities.supportsRunInTerminalRequest = args.SupportsRunInTerminalRequest
 	s.clientCapabilities.supportsVariablePaging = args.SupportsVariablePaging
+	if s.clientCapabilities.supportsVariablePaging {
+		// Lower the initial loaded value, since we can load on demand
+		DefaultLoadConfig.MaxArrayValues = 10
+	}
 	s.clientCapabilities.supportsVariableType = args.SupportsVariableType
 }
 
@@ -1751,7 +1755,7 @@ func (s *Server) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr s
 				value = fmt.Sprintf("(loaded %d/%d) ", len(v.Children), v.Len) + value
 			}
 		}
-		if v.Base != 0 && len(v.Children) > 0 {
+		if v.Base != 0 && v.Len > 0 {
 			variablesReference = maybeCreateVariableHandle(v)
 		}
 	case reflect.Map:
@@ -1762,7 +1766,7 @@ func (s *Server) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr s
 				value = fmt.Sprintf("(loaded %d/%d) ", len(v.Children)/2, v.Len) + value
 			}
 		}
-		if v.Base != 0 && len(v.Children) > 0 {
+		if v.Base != 0 && v.Len > 0 {
 			variablesReference = maybeCreateVariableHandle(v)
 		}
 	case reflect.String:
