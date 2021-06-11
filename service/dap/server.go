@@ -1848,7 +1848,7 @@ func (s *Server) getTypeIfSupported(v *proc.Variable) string {
 	if !s.clientCapabilities.supportsVariableType {
 		return ""
 	}
-	return v.TypeString()
+	return api.ConvertVar(v).TypeString()
 }
 
 // convertVariable converts proc.Variable to dap.Variable value and reference
@@ -1894,7 +1894,8 @@ func (s *Server) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr s
 		}
 		return s.variableHandles.create(&fullyQualifiedVariable{v, qualifiedNameOrExpr, false /*not a scope*/, 0})
 	}
-	value = api.ConvertVar(v).SinglelineString()
+	apiVar := api.ConvertVar(v)
+	value = apiVar.SinglelineStringValuesOnly()
 	if v.Unreadable != nil {
 		return value, 0
 	}
@@ -1908,7 +1909,7 @@ func (s *Server) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr s
 		// TODO(polina): Get *proc.Variable object from debugger instead. Export a function to set v.loaded to false
 		// and call v.loadValue gain with a different load config. It's more efficient, and it's guaranteed to keep
 		// working with generics.
-		value = api.ConvertVar(v).SinglelineString()
+		value = api.ConvertVar(v).SinglelineStringValuesOnly()
 		typeName := api.PrettyTypeName(v.DwarfType)
 		loadExpr := fmt.Sprintf("*(*%q)(%#x)", typeName, v.Addr)
 		s.log.Debugf("loading %s (type %s) with %s", qualifiedNameOrExpr, typeName, loadExpr)
@@ -1921,7 +1922,7 @@ func (s *Server) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr s
 			value += fmt.Sprintf(" - FAILED TO LOAD: %s", err)
 		} else {
 			v.Children = vLoaded.Children
-			value = api.ConvertVar(v).SinglelineString()
+			value = api.ConvertVar(v).SinglelineStringValuesOnly()
 		}
 		return value
 	}
@@ -1950,7 +1951,7 @@ func (s *Server) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr s
 					} else {
 						cLoaded.Name = v.Children[0].Name // otherwise, this will be the pointer expression
 						v.Children = []proc.Variable{*cLoaded}
-						value = api.ConvertVar(v).SinglelineString()
+						value = api.ConvertVar(v).SinglelineStringValuesOnly()
 					}
 				} else {
 					value = reloadVariable(v, qualifiedNameOrExpr)
