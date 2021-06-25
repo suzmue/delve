@@ -1919,15 +1919,16 @@ func (s *Server) metadataToDAPVariables(v *fullyQualifiedVariable) ([]dap.Variab
 		// We know that this is an array/slice of Uint8 or Int32, so we will load up to MaxStringLen.
 		config := DefaultLoadConfig
 		config.MaxArrayValues = config.MaxStringLen
-		vLoaded, err := s.debugger.EvalVariableInScope(-1, 0, 0, loadExpr, config)
+		vLoaded, err := s.debugger.EvalExpressionInScope(-1, 0, 0, loadExpr, config)
 		val := s.convertVariableToString(vLoaded)
 		if err == nil {
 			// TODO(suzmue): Add evaluate name. Using string(name) will not get the same result because the
 			// MaxArrayValues is not auto adjusted in evaluate requests like MaxStringLen is adjusted.
 			children = append(children, dap.Variable{
-				Name:  "string()",
-				Value: val,
-				Type:  "string",
+				Name:         "string()",
+				EvaluateName: loadExpr,
+				Value:        val,
+				Type:         "string",
 			})
 		}
 	}
@@ -2182,28 +2183,13 @@ func (s *Server) onEvaluateRequest(request *dap.EvaluateRequest) {
 			}
 		}
 	} else { // {expression}
-		exprVar, err := s.debugger.EvalVariableInScope(goid, frame, 0, request.Arguments.Expression, DefaultLoadConfig)
+		ctxt := request.Arguments.Context
+		exprVar, err := s.debugger.EvalExpressionInScope(goid, frame, 0, request.Arguments.Expression, DefaultLoadConfig)
 		if err != nil {
 			s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", err.Error(), showErrorToUser)
 			return
 		}
 
-		ctxt := request.Arguments.Context
-		switch ctxt {
-		case "repl", "variables", "hover", "clipboard":
-			if exprVar.Kind == reflect.String {
-				if strVal := constant.StringVal(exprVar.Value); exprVar.Len > int64(len(strVal)) {
-					// Reload the string value with a bigger limit.
-					loadCfg := DefaultLoadConfig
-					loadCfg.MaxStringLen = maxSingleStringLen
-					if v, err := s.debugger.EvalVariableInScope(goid, frame, 0, request.Arguments.Expression, loadCfg); err != nil {
-						s.log.Debugf("Failed to load more for %v: %v", request.Arguments.Expression, err)
-					} else {
-						exprVar = v
-					}
-				}
-			}
-		}
 		var opts convertVariableFlags
 		// Send the full value when the context is "clipboard" or "variables" since
 		// these contexts are used to copy the value.

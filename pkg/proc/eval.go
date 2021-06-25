@@ -156,6 +156,15 @@ func GoroutineScope(thread Thread) (*EvalScope, error) {
 
 // EvalExpression returns the value of the given expression.
 func (scope *EvalScope) EvalExpression(expr string, cfg LoadConfig) (*Variable, error) {
+	return scope.evalExpression(expr, cfg, true)
+}
+
+// EvalExpressionAll returns the value of the given expression.
+func (scope *EvalScope) EvalExpressionAll(expr string, cfg LoadConfig) (*Variable, error) {
+	return scope.evalExpression(expr, cfg, false)
+}
+
+func (scope *EvalScope) evalExpression(expr string, cfg LoadConfig, truncate bool) (*Variable, error) {
 	if scope.callCtx != nil {
 		// makes sure that the other goroutine won't wait forever if we make a mistake
 		defer close(scope.callCtx.continueRequest)
@@ -173,7 +182,14 @@ func (scope *EvalScope) EvalExpression(expr string, cfg LoadConfig) (*Variable, 
 		return nil, err
 	}
 
-	ev, err := scope.evalToplevelTypeCast(t, cfg)
+	ev, maxVal, truncated, err := scope.evalToplevelTypeCast(t, cfg)
+	if !truncate && truncated {
+		newConfig := cfg
+		newConfig.MaxArrayValues = maxVal
+		newConfig.MaxStringLen = maxVal
+		ev, _, _, err = scope.evalToplevelTypeCast(t, newConfig)
+	}
+
 	if ev == nil && err == nil {
 		ev, err = scope.evalAST(t)
 	}
@@ -568,10 +584,11 @@ func (scope *EvalScope) PtrSize() int {
 
 // evalToplevelTypeCast implements certain type casts that we only support
 // at the outermost levels of an expression.
-func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Variable, error) {
+func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Variable, int, bool, error) {
+	// TODO(suzmue): Need to know if we did truncate, and what limits would be needed to load enough.
 	call, _ := t.(*ast.CallExpr)
 	if call == nil || len(call.Args) != 1 {
-		return nil, nil
+		return nil, 0, false, nil
 	}
 	targetTypeStr := exprToString(removeParen(call.Fun))
 	var targetType godwarf.Type
@@ -584,22 +601,26 @@ func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Varia
 		var err error
 		targetType, err = scope.BinInfo.findType("string")
 		if err != nil {
-			return nil, err
+			return nil, 0, false, err
 		}
 	default:
-		return nil, nil
+		return nil, 0, false, nil
 	}
 
-	argv, err := scope.evalToplevelTypeCast(call.Args[0], cfg)
+	argv, maxVal, truncated, err := scope.evalToplevelTypeCast(call.Args[0], cfg)
 	if argv == nil && err == nil {
 		argv, err = scope.evalAST(call.Args[0])
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
 	argv.loadValue(cfg)
 	if argv.Unreadable != nil {
-		return nil, argv.Unreadable
+		return nil, 0, false, argv.Unreadable
+	}
+	truncated = truncated || int(argv.Len) > len(argv.Children)
+	if truncated && int(argv.Len) > maxVal {
+		maxVal = int(argv.Len)
 	}
 
 	v := newVariable("", 0, targetType, scope.BinInfo, scope.Mem)
@@ -610,7 +631,7 @@ func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Varia
 	switch targetTypeStr {
 	case "[]byte", "[]uint8":
 		if argv.Kind != reflect.String {
-			return nil, converr
+			return nil, 0, false, converr
 		}
 		for i, ch := range []byte(constant.StringVal(argv.Value)) {
 			e := newVariable("", argv.Addr+uint64(i), targetType.(*godwarf.SliceType).ElemType, scope.BinInfo, argv.mem)
@@ -620,11 +641,11 @@ func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Varia
 		}
 		v.Len = int64(len(v.Children))
 		v.Cap = v.Len
-		return v, nil
+		return v, maxVal, truncated, nil
 
 	case "[]int32", "[]rune":
 		if argv.Kind != reflect.String {
-			return nil, converr
+			return nil, 0, false, converr
 		}
 		for i, ch := range constant.StringVal(argv.Value) {
 			e := newVariable("", argv.Addr+uint64(i), targetType.(*godwarf.SliceType).ElemType, scope.BinInfo, argv.mem)
@@ -634,7 +655,7 @@ func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Varia
 		}
 		v.Len = int64(len(v.Children))
 		v.Cap = v.Len
-		return v, nil
+		return v, maxVal, truncated, nil
 
 	case "string":
 		switch argv.Kind {
@@ -642,13 +663,13 @@ func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Varia
 			s := constant.StringVal(argv.Value)
 			v.Value = constant.MakeString(s)
 			v.Len = int64(len(s))
-			return v, nil
+			return v, maxVal, truncated, nil
 		case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint, reflect.Uintptr:
 			b, _ := constant.Int64Val(argv.Value)
 			s := string(rune(b))
 			v.Value = constant.MakeString(s)
 			v.Len = int64(len(s))
-			return v, nil
+			return v, maxVal, truncated, nil
 		case reflect.Slice, reflect.Array:
 			var elem godwarf.Type
 			if argv.Kind == reflect.Slice {
@@ -659,7 +680,7 @@ func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Varia
 			switch elemType := elem.(type) {
 			case *godwarf.UintType:
 				if elemType.Name != "uint8" && elemType.Name != "byte" {
-					return nil, nil
+					return nil, 0, false, nil
 				}
 				bytes := make([]byte, len(argv.Children))
 				for i := range argv.Children {
@@ -670,7 +691,7 @@ func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Varia
 
 			case *godwarf.IntType:
 				if elemType.Name != "int32" && elemType.Name != "rune" {
-					return nil, nil
+					return nil, 0, false, nil
 				}
 				runes := make([]rune, len(argv.Children))
 				for i := range argv.Children {
@@ -680,17 +701,17 @@ func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Varia
 				v.Value = constant.MakeString(string(runes))
 
 			default:
-				return nil, nil
+				return nil, 0, false, nil
 			}
 			v.Len = int64(len(constant.StringVal(v.Value)))
-			return v, nil
+			return v, maxVal, truncated, nil
 
 		default:
-			return nil, nil
+			return nil, 0, false, nil
 		}
 	}
 
-	return nil, nil
+	return nil, 0, false, nil
 }
 
 func (scope *EvalScope) evalAST(t ast.Expr) (*Variable, error) {
