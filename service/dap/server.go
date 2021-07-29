@@ -2905,7 +2905,14 @@ func (s *Server) halt() (*api.DebuggerState, error) {
 	return s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
 }
 
+// resume is a helper function to resume the execution
+// of the target when the program is halted, but no
+// stopped event has been sent.
 func (s *Server) resume() (*api.DebuggerState, error) {
+	// No other goroutines should be able to try to halt
+	// execution while this goroutine is continuing
+	// the program.
+	// Hold onto haltMu until the program is running.
 	resumeNotify := make(chan struct{}, 1)
 	s.haltMu.Lock()
 	go func() {
@@ -2913,6 +2920,9 @@ func (s *Server) resume() (*api.DebuggerState, error) {
 		s.haltMu.Unlock()
 	}()
 
+	// There may have been a manual halt while the program was
+	// stopped. If this happened, do not continue exection of
+	// the program.
 	if s.debugger.CheckAndClearManualStopRequest() {
 		// A halt request came in so we need to CancelNext.
 		if err := s.debugger.CancelNext(); err != nil {
