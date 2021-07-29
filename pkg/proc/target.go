@@ -43,6 +43,8 @@ type Target struct {
 	// case only one will be reported.
 	StopReason StopReason
 
+	ShouldNotClear bool
+
 	// CanDump is true if core dumping is supported.
 	CanDump bool
 

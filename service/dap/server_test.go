@@ -2494,6 +2494,7 @@ func TestLogPoints(t *testing.T) {
 					}
 					checkStop(t, client, 1, "main.main", 27)
 
+					// Test that log points work with continue.
 					client.NextRequest(1)
 					client.ExpectNextResponse(t)
 
@@ -2502,13 +2503,11 @@ func TestLogPoints(t *testing.T) {
 						t.Errorf("got output event = %#v, \nwant Category=\"stdout\" Output=\"in callme2!\n\"", oe)
 					}
 
-					// This logpoint interrupted a next request, so the program will have halted at
-					// the breakpoint line.
 					se = client.ExpectStoppedEvent(t)
-					if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
-						t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
+					if se.Body.Reason != "step" || se.Body.ThreadId != 1 {
+						t.Errorf("got stopped event = %#v, \nwant Reason=\"step\" ThreadId=1", se)
 					}
-					checkStop(t, client, 1, "main.callme2", 16)
+					checkStop(t, client, 1, "main.main", 28)
 				},
 				disconnect: true,
 			}})

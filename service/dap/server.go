@@ -211,6 +211,7 @@ func NewServer(config *service.Config) *Server {
 	logger := logflags.DAPLogger()
 	logflags.WriteDAPListeningMessage(config.Listener.Addr().String())
 	logger.Debug("DAP server pid = ", os.Getpid())
+	config.Debugger.ShouldNotClear = true
 	return &Server{
 		config:            config,
 		listener:          config.Listener,
@@ -2947,25 +2948,13 @@ func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
 	s.setRunning(true)
 	defer s.setRunning(false)
 
-	runningStep := command != api.Continue
-	state, _ := s.debugger.State(true)
-	if state != nil {
-		runningStep = runningStep || state.NextInProgress
-	}
-
 	state, err := s.debugger.Command(&api.DebuggerCommand{Name: command}, asyncSetupDone)
 	for state != nil && state.CurrentThread != nil && err == nil {
 		// If this is a log point, we want to log the message and continue execution.
 		if bp := state.CurrentThread.Breakpoint; bp != nil && bp.Tracepoint {
 			s.handleLogPoint(bp.ID)
-			// Only resume execution if continue was the command used to run the program.
-			// Otherwise, the program will go past the step, next, stepout requests.
-			// TODO(suzmue): have s.debugger.Command() not clear internal breakpoints when
-			// hitting another breakpoint.
-			if (runningStep && state.NextInProgress) || command == api.Continue {
-				state, err = s.resume()
-				continue
-			}
+			state, err = s.resume()
+			continue
 		}
 		break
 	}
@@ -2987,6 +2976,13 @@ func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
 	stopped.Body.AllThreadsStopped = true
 
 	if err == nil {
+		// If stopped on a breakpoint on the goroutine that is currently being
+		// stepped on, cancel next before proceeding.
+		if state != nil && state.OnNextGoroutine {
+			if err := s.debugger.CancelNext(); err != nil {
+				s.log.Error(err)
+			}
+		}
 		// TODO(suzmue): If stopped.Body.ThreadId is not a valid goroutine
 		// then the stopped reason does not show up anywhere in the
 		// vscode ui.

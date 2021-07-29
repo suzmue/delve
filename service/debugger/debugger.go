@@ -137,6 +137,8 @@ type Config struct {
 
 	// DisableASLR disables ASLR
 	DisableASLR bool
+
+	ShouldNotClear bool
 }
 
 // New creates a new Debugger. ProcessArgs specify the commandline arguments for the
@@ -206,6 +208,7 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 	}
 
 	d.disabledBreakpoints = make(map[int]*api.Breakpoint)
+	d.target.ShouldNotClear = config.ShouldNotClear
 
 	return d, nil
 }
@@ -618,6 +621,9 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig) (*api.DebuggerState, error
 	}
 
 	state.NextInProgress = d.target.Breakpoints().HasSteppingBreakpoints()
+	if onNextGoroutine, err := proc.OnNextGoroutine(d.target.CurrentThread(), d.target.Breakpoints()); err != nil {
+		state.OnNextGoroutine = onNextGoroutine
+	}
 
 	if recorded, _ := d.target.Recorded(); recorded {
 		state.When, _ = d.target.When()
