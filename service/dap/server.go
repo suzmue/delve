@@ -130,6 +130,11 @@ type Server struct {
 	// sendingMu synchronizes writing to net.Conn
 	// to ensure that messages do not get interleaved
 	sendingMu sync.Mutex
+
+	runningMu sync.Mutex
+	running   bool
+
+	haltMu sync.Mutex
 }
 
 // launchAttachArgs captures arguments from launch/attach request that
@@ -450,7 +455,7 @@ func (s *Server) handleRequest(request dap.Message) {
 	// the next stop. In addition, the editor itself might block waiting
 	// for these requests to return. We are not aware of any requests
 	// that would benefit from this approach at this time.
-	if s.debugger != nil && s.debugger.IsRunning() {
+	if s.debugger != nil && s.isRunning() {
 		switch request := request.(type) {
 		case *dap.ThreadsRequest:
 			// On start-up, the client requests the baseline of currently existing threads
@@ -466,7 +471,7 @@ func (s *Server) handleRequest(request dap.Message) {
 			s.send(response)
 		case *dap.SetBreakpointsRequest:
 			s.log.Debug("halting execution to set breakpoints")
-			_, err := s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
+			_, err := s.halt()
 			if err != nil {
 				s.sendErrorResponse(request.Request, UnableToSetBreakpoints, "Unable to set or clear breakpoints", err.Error())
 				return
@@ -488,7 +493,7 @@ func (s *Server) handleRequest(request dap.Message) {
 			// in proc.(*Target).Continue, leaving NextInProgress as true.
 		case *dap.SetFunctionBreakpointsRequest:
 			s.log.Debug("halting execution to set breakpoints")
-			_, err := s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
+			_, err := s.halt()
 			if err != nil {
 				s.sendErrorResponse(request.Request, UnableToSetBreakpoints, "Unable to set or clear breakpoints", err.Error())
 				return
@@ -1082,7 +1087,7 @@ func (s *Server) stopDebugSession(killProcess bool) error {
 	// To avoid goroutine leaks, we can use a wait group or have the goroutine listen
 	// for a stop signal on a dedicated quit channel at suitable points (use context?).
 	// Additional clean-up might be especially critical when we support multiple clients.
-	state, err := s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
+	state, err := s.halt()
 	if err == proc.ErrProcessDetached {
 		s.log.Debug("halt returned error: ", err)
 		return nil
@@ -1645,7 +1650,7 @@ func (s *Server) doStepCommand(command string, threadId int, asyncSetupDone chan
 // onPauseRequest handles 'pause' request.
 // This is a mandatory request to support.
 func (s *Server) onPauseRequest(request *dap.PauseRequest) {
-	_, err := s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
+	_, err := s.halt()
 	if err != nil {
 		s.sendErrorResponse(request.Request, UnableToHalt, "Unable to halt execution", err.Error())
 		return
@@ -2850,6 +2855,47 @@ func processExited(state *api.DebuggerState, err error) bool {
 	_, isexited := err.(proc.ErrProcessExited)
 	return isexited || err == nil && state.Exited
 }
+func (s *Server) setRunning(running bool) {
+	s.runningMu.Lock()
+	s.running = running
+	s.runningMu.Unlock()
+}
+
+func (s *Server) isRunning() bool {
+	s.runningMu.Lock()
+	defer s.runningMu.Unlock()
+	return s.running
+}
+
+// halt is a helper function to allow dap to make sure that a halt
+// is processed. It is possible that this halt request will come in while a
+// a breakpoint is being processed. If the debugger decides to resume execution
+// after processing the breakpoint, the halt request would be skipped. Additional
+// synchronization is required between "resume" and "halt" to make sure this does
+// not happen.
+func (s *Server) halt() (*api.DebuggerState, error) {
+	s.haltMu.Lock()
+	defer s.haltMu.Unlock()
+	return s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
+}
+
+func (s *Server) resume() (*api.DebuggerState, error) {
+	resumeNotify := make(chan struct{}, 1)
+	s.haltMu.Lock()
+	go func() {
+		<-resumeNotify
+		s.haltMu.Unlock()
+	}()
+
+	if s.debugger.CheckAndClearManualStopRequest() {
+		// A halt request came in so we need to CancelNext.
+		if err := s.debugger.CancelNext(); err != nil {
+			s.log.Error(err)
+		}
+		return s.debugger.State(false)
+	}
+	return s.debugger.Command(&api.DebuggerCommand{Name: api.Continue}, resumeNotify)
+}
 
 // doRunCommand runs a debugger command until it stops on
 // termination, error, breakpoint, etc, when an appropriate
@@ -2862,7 +2908,24 @@ func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
 	// asyncSetupDone (e.g. when having an error next while nexting).
 	// So we should always close it ourselves just in case.
 	defer s.asyncCommandDone(asyncSetupDone)
+	s.setRunning(true)
+	defer s.setRunning(false)
+
 	state, err := s.debugger.Command(&api.DebuggerCommand{Name: command}, asyncSetupDone)
+	for {
+		if state == nil || err != nil {
+			break
+		}
+		// If this is a log point, we want to log the message and continue.
+		if bp := state.CurrentThread.Breakpoint; bp != nil {
+			if !bp.Tracepoint {
+				break
+			}
+			s.logToConsole("hit tracepoint")
+		}
+		state, err = s.resume()
+	}
+
 	if processExited(state, err) {
 		s.send(&dap.TerminatedEvent{Event: *newEvent("terminated")})
 		return
