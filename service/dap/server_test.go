@@ -2451,6 +2451,70 @@ func TestSetFunctionBreakpoints(t *testing.T) {
 	})
 }
 
+// TestLogpoints executes to a breakpoint and tests logpoints
+// send OutputEvents and do not halt program execution.
+func TestLogPoints(t *testing.T) {
+	runTest(t, "callme", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{23},
+			[]onBreakpoint{{
+				// Stop at line 23
+				execute: func() {
+					bps := []int{6, 25, 27, 16}
+					logMessages := map[int]string{6: "in callme!", 16: "in callme2!"}
+					client.SetLogpointsRequest(fixture.Source, bps, logMessages)
+					client.ExpectSetBreakpointsResponse(t)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+
+					for i := 0; i < 5; i++ {
+						se := client.ExpectStoppedEvent(t)
+						if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
+							t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
+						}
+						checkStop(t, client, 1, "main.main", 25)
+
+						client.ContinueRequest(1)
+						client.ExpectContinueResponse(t)
+
+						oe := client.ExpectOutputEvent(t)
+						if oe.Body.Category != "stdout" || oe.Body.Output != "in callme!\n" {
+							t.Errorf("got output event = %#v, \nwant Category=\"stdout\" Output=\"in callme!\n\"", oe)
+						}
+					}
+					se := client.ExpectStoppedEvent(t)
+					if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
+						t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
+					}
+					checkStop(t, client, 1, "main.main", 27)
+
+					client.NextRequest(1)
+					client.ExpectNextResponse(t)
+
+					oe := client.ExpectOutputEvent(t)
+					if oe.Body.Category != "stdout" || oe.Body.Output != "in callme2!\n" {
+						t.Errorf("got output event = %#v, \nwant Category=\"stdout\" Output=\"in callme2!\n\"", oe)
+					}
+
+					// This logpoint interrupted a next request, so the program will have halted at
+					// the breakpoint line.
+					se = client.ExpectStoppedEvent(t)
+					if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
+						t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
+					}
+					checkStop(t, client, 1, "main.callme2", 16)
+				},
+				disconnect: true,
+			}})
+	})
+}
+
 func expectSetBreakpointsResponseAndStoppedEvent(t *testing.T, client *daptest.Client) (se *dap.StoppedEvent, br *dap.SetBreakpointsResponse) {
 	for i := 0; i < 2; i++ {
 		switch m := client.ExpectMessage(t).(type) {
@@ -3356,76 +3420,6 @@ func TestNextAndStep(t *testing.T) {
 					checkStop(t, client, 1, "main.inlineThis", 5)
 				},
 				disconnect: false,
-			}})
-	})
-}
-
-func TestNextInterrupted(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
-	// a breakpoint triggering during a 'next' operation will interrupt it
-	// Unlike the test for the terminal package, we cannot be certain
-	// of the number of breakpoints we expect to hit, since multiple
-	// breakpoints being hit at the same time is not supported in dap stopped
-	// events.
-	runTest(t, "issue387", func(client *daptest.Client, fixture protest.Fixture) {
-		runDebugSessionWithBPs(t, client, "launch",
-			// Launch
-			func() {
-				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
-			},
-			// Set breakpoints
-			fixture.Source, []int{15},
-			[]onBreakpoint{{ // Stop at line 15
-				execute: func() {
-					checkStop(t, client, 1, "main.main", 15)
-
-					client.SetBreakpointsRequest(fixture.Source, []int{8})
-					client.ExpectSetBreakpointsResponse(t)
-
-					client.ContinueRequest(1)
-					client.ExpectContinueResponse(t)
-
-					bpSe := client.ExpectStoppedEvent(t)
-					checkStop(t, client, bpSe.Body.ThreadId, "main.dostuff", 8)
-
-					outputString := `goroutine \d+ hit breakpoint \(id: 2, loc: .*issue387.go:8\) during next`
-					skipBreakpointRegExp, _ := regexp.Compile(outputString)
-					for pos := 9; pos < 11; pos++ {
-						client.NextRequest(bpSe.Body.ThreadId)
-						client.ExpectNextResponse(t)
-
-						stopped := false
-						for !stopped {
-							msg := client.ExpectMessage(t)
-							switch v := msg.(type) {
-							case *dap.StoppedEvent:
-								if v.Body.Reason != "step" || !v.Body.AllThreadsStopped {
-									t.Errorf("got %#v, want Reason=\"step\", ThreadId=1, AllThreadsStopped=true", v)
-								}
-								checkStop(t, client, bpSe.Body.ThreadId, "main.dostuff", pos)
-								stopped = true
-							case *dap.OutputEvent:
-								wantOutput := dap.OutputEvent{
-									Event: *newEvent("output"),
-									Body: dap.OutputEventBody{
-										Output:   "goroutine ... hit breakpoint (id: ..., loc: .../issue387.go:8) during next\n",
-										Category: "console",
-									},
-								}
-								matched := skipBreakpointRegExp.MatchString(v.Body.Output)
-								if !matched || v.Body.Category != "console" {
-									t.Errorf("\ngot  %#v\nwant %#v", v, wantOutput)
-								}
-							default:
-								t.Errorf("got %t, want *dap.StoppedEvent or *dap.OutputEvent", msg)
-							}
-
-						}
-					}
-				},
-				disconnect: true,
 			}})
 	})
 }

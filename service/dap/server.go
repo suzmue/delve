@@ -113,6 +113,8 @@ type Server struct {
 	exceptionErr error
 	// clientCapabilities tracks special settings for handling debug session requests.
 	clientCapabilities dapClientCapabilites
+	// logMessages maps a breakpoint id to a log message
+	logMessages map[int]string
 
 	// mu synchronizes access to objects set on start-up (from run goroutine)
 	// and stopped on teardown (from main goroutine)
@@ -216,6 +218,7 @@ func NewServer(config *service.Config) *Server {
 		log:               logger,
 		stackFrameHandles: newHandlesMap(),
 		variableHandles:   newVariablesHandlesMap(),
+		logMessages:       make(map[int]string),
 		args:              defaultArgs,
 		exceptionErr:      nil,
 	}
@@ -724,6 +727,7 @@ func (s *Server) onInitializeRequest(request *dap.InitializeRequest) {
 	response.Body.SupportsSetVariable = true
 	response.Body.SupportsEvaluateForHovers = true
 	response.Body.SupportsClipboardContext = true
+	response.Body.SupportsLogPoints = true
 	// TODO(polina): support these requests in addition to vscode-go feature parity
 	response.Body.SupportsTerminateRequest = false
 	response.Body.SupportsRestartRequest = false
@@ -1182,6 +1186,8 @@ func (s *Server) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
 		} else {
 			got.Cond = want.Condition
 			got.HitCond = want.HitCondition
+			got.Tracepoint = want.LogMessage != ""
+			s.updateLogMessage(got.ID, want.LogMessage)
 			err = s.debugger.AmendBreakpoint(got)
 			bpAdded[reqString] = struct{}{}
 		}
@@ -1209,16 +1215,35 @@ func (s *Server) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
 		} else {
 			// Create new breakpoints.
 			got, err = s.debugger.CreateBreakpoint(
-				&api.Breakpoint{File: serverPath, Line: want.Line, Cond: want.Condition, HitCond: want.HitCondition, Name: reqString})
+				&api.Breakpoint{
+					File:       serverPath,
+					Line:       want.Line,
+					Cond:       want.Condition,
+					HitCond:    want.HitCondition,
+					Name:       reqString,
+					Tracepoint: want.LogMessage != "",
+				})
+			if got != nil {
+				s.updateLogMessage(got.ID, want.LogMessage)
+			}
 			bpAdded[reqString] = struct{}{}
 		}
 
 		updateBreakpointsResponse(breakpoints, i, err, got, clientPath)
 	}
+
 	response := &dap.SetBreakpointsResponse{Response: *newResponse(request.Request)}
 	response.Body.Breakpoints = breakpoints
 
 	s.send(response)
+}
+
+func (s *Server) updateLogMessage(id int, msg string) {
+	if msg == "" {
+		delete(s.logMessages, id)
+		return
+	}
+	s.logMessages[id] = msg
 }
 
 func updateBreakpointsResponse(breakpoints []dap.Breakpoint, i int, err error, got *api.Breakpoint, path string) {
@@ -1361,6 +1386,7 @@ func (s *Server) clearBreakpoints(existingBps map[string]*api.Breakpoint, bpAdde
 		if _, ok := bpAdded[req]; ok {
 			continue
 		}
+		s.updateLogMessage(bp.ID, "")
 		_, err := s.debugger.ClearBreakpoint(bp)
 		if err != nil {
 			return err
@@ -2911,19 +2937,27 @@ func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
 	s.setRunning(true)
 	defer s.setRunning(false)
 
+	runningStep := command != api.Continue
+	state, _ := s.debugger.State(true)
+	if state != nil {
+		runningStep = runningStep || state.NextInProgress
+	}
+
 	state, err := s.debugger.Command(&api.DebuggerCommand{Name: command}, asyncSetupDone)
-	for {
-		if state == nil || err != nil {
-			break
-		}
-		// If this is a log point, we want to log the message and continue.
-		if bp := state.CurrentThread.Breakpoint; bp != nil {
-			if !bp.Tracepoint {
-				break
+	for state != nil && state.CurrentThread != nil && err == nil {
+		// If this is a log point, we want to log the message and continue execution.
+		if bp := state.CurrentThread.Breakpoint; bp != nil && bp.Tracepoint {
+			s.handleLogPoint(bp.ID)
+			// Only resume execution if continue was the command used to run the program.
+			// Otherwise, the program will go past the step, next, stepout requests.
+			// TODO(suzmue): have s.debugger.Command() not clear internal breakpoints when
+			// hitting another breakpoint.
+			if (runningStep && state.NextInProgress) || command == api.Continue {
+				state, err = s.resume()
+				continue
 			}
-			s.logToConsole("hit tracepoint")
 		}
-		state, err = s.resume()
+		break
 	}
 
 	if processExited(state, err) {
@@ -3006,6 +3040,19 @@ func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
 	// Send an output event with more information if next is in progress.
 	if state != nil && state.NextInProgress {
 		s.logToConsole("Step interrupted by a breakpoint. Use 'Continue' to resume the original step command.")
+	}
+}
+
+func (s *Server) handleLogPoint(id int) {
+	// TODO(suzmue): allow evaluate expressions within log points.
+	if msg, ok := s.logMessages[id]; ok {
+		s.send(&dap.OutputEvent{
+			Event: *newEvent("output"),
+			Body: dap.OutputEventBody{
+				Category: "stdout",
+				Output:   msg + "\n",
+			},
+		})
 	}
 }
 
