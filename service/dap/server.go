@@ -137,6 +137,8 @@ type Server struct {
 	running   bool
 
 	haltMu sync.Mutex
+
+	haltChan chan string
 }
 
 // launchAttachArgs captures arguments from launch/attach request that
@@ -222,6 +224,7 @@ func NewServer(config *service.Config) *Server {
 		logMessages:       make(map[int]string),
 		args:              defaultArgs,
 		exceptionErr:      nil,
+		haltChan:          make(chan string, 1),
 	}
 }
 
@@ -412,6 +415,12 @@ func (s *Server) recoverPanic(request dap.Message) {
 func (s *Server) handleRequest(request dap.Message) {
 	defer s.recoverPanic(request)
 
+	s.haltMu.Lock()
+	defer func() {
+		s.log.Debug("releasing haltmu")
+		s.haltMu.Unlock()
+	}()
+
 	jsonmsg, _ := json.Marshal(request)
 	s.log.Debug("[<- from client]", string(jsonmsg))
 
@@ -474,6 +483,8 @@ func (s *Server) handleRequest(request dap.Message) {
 			}
 			s.send(response)
 		case *dap.SetBreakpointsRequest:
+			s.haltChan <- ""
+
 			s.log.Debug("halting execution to set breakpoints")
 			_, err := s.halt()
 			if err != nil {
@@ -496,6 +507,7 @@ func (s *Server) handleRequest(request dap.Message) {
 			// introduce a new version of halt that skips ClearInternalBreakpoints
 			// in proc.(*Target).Continue, leaving NextInProgress as true.
 		case *dap.SetFunctionBreakpointsRequest:
+			s.haltChan <- ""
 			s.log.Debug("halting execution to set breakpoints")
 			_, err := s.halt()
 			if err != nil {
@@ -2901,8 +2913,6 @@ func (s *Server) isRunning() bool {
 // synchronization is required between "resume" and "halt" to make sure this does
 // not happen.
 func (s *Server) halt() (*api.DebuggerState, error) {
-	s.haltMu.Lock()
-	defer s.haltMu.Unlock()
 	return s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
 }
 
@@ -2910,6 +2920,10 @@ func (s *Server) halt() (*api.DebuggerState, error) {
 // of the target when the program is halted, but no
 // stopped event has been sent.
 func (s *Server) resume() (*api.DebuggerState, error) {
+	select {
+	case <-s.haltChan:
+	default:
+	}
 	// No other goroutines should be able to try to halt
 	// execution while this goroutine is continuing
 	// the program.
@@ -2918,8 +2932,11 @@ func (s *Server) resume() (*api.DebuggerState, error) {
 	s.haltMu.Lock()
 	go func() {
 		<-resumeNotify
+		s.log.Debug("releasing haltmu from resume")
 		s.haltMu.Unlock()
 	}()
+
+	s.log.Debug("resuming execution of the target")
 
 	// There may have been a manual halt while the program was
 	// stopped. If this happened, do not continue exection of
@@ -2941,6 +2958,10 @@ func (s *Server) resume() (*api.DebuggerState, error) {
 // asynchornous command has completed setup or was interrupted
 // due to an error, so the server is ready to receive new requests.
 func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
+	select {
+	case <-s.haltChan:
+	default:
+	}
 	// TODO(polina): it appears that debugger.Command doesn't always close
 	// asyncSetupDone (e.g. when having an error next while nexting).
 	// So we should always close it ourselves just in case.
@@ -2949,12 +2970,20 @@ func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
 	defer s.setRunning(false)
 
 	state, err := s.debugger.Command(&api.DebuggerCommand{Name: command}, asyncSetupDone)
-	for state != nil && state.CurrentThread != nil && err == nil {
-		// If this is a log point, we want to log the message and continue execution.
-		if bp := state.CurrentThread.Breakpoint; bp != nil && bp.Tracepoint {
-			s.handleLogPoint(bp.ID)
+	for err == nil {
+		if state != nil && state.CurrentThread != nil {
+			// If this is a log point, we want to log the message and continue execution.
+			if bp := state.CurrentThread.Breakpoint; bp != nil && bp.Tracepoint {
+				s.handleLogPoint(bp.ID)
+				state, err = s.resume()
+				continue
+			}
+		}
+		select {
+		case <-s.haltChan:
 			state, err = s.resume()
 			continue
+		default:
 		}
 		break
 	}
