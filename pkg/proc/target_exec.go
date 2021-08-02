@@ -60,13 +60,17 @@ func (dbp *Target) Continue() error {
 		// manual stop request and hit a breakpoint.
 		if dbp.CheckAndClearManualStopRequest() {
 			dbp.StopReason = StopManual
-			dbp.ClearSteppingBreakpoints()
+			if !dbp.ShouldNotClear {
+				dbp.ClearSteppingBreakpoints()
+			}
 		}
 	}()
 	for {
 		if dbp.CheckAndClearManualStopRequest() {
 			dbp.StopReason = StopManual
-			dbp.ClearSteppingBreakpoints()
+			if !dbp.ShouldNotClear {
+				dbp.ClearSteppingBreakpoints()
+			}
 			return nil
 		}
 		dbp.ClearCaches()

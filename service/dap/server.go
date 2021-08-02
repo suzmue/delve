@@ -2981,6 +2981,7 @@ func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
 		}
 		select {
 		case <-s.haltChan:
+			s.debugger.CheckAndClearManualStopRequest()
 			state, err = s.resume()
 			continue
 		default:
