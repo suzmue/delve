@@ -166,6 +166,7 @@ type dapClientCapabilites struct {
 	supportsRunInTerminalRequest bool
 	supportsMemoryReferences     bool
 	supportsProgressReporting    bool
+	supportsInvalidatedEvent     bool
 }
 
 // DefaultLoadConfig controls how variables are loaded from the target's memory.
@@ -724,7 +725,7 @@ func (s *Server) onInitializeRequest(request *dap.InitializeRequest) {
 	response.Body.SupportsRestartRequest = false
 	response.Body.SupportsStepBack = false // To be enabled by CapabilitiesEvent based on configuration
 	response.Body.SupportsSetExpression = false
-	response.Body.SupportsLoadedSourcesRequest = false
+	response.Body.SupportsLoadedSourcesRequest = true
 	response.Body.SupportsReadMemoryRequest = false
 	response.Body.SupportsDisassembleRequest = false
 	response.Body.SupportsCancelRequest = false
@@ -737,6 +738,7 @@ func (s *Server) setClientCapabilities(args dap.InitializeRequestArguments) {
 	s.clientCapabilities.supportsRunInTerminalRequest = args.SupportsRunInTerminalRequest
 	s.clientCapabilities.supportsVariablePaging = args.SupportsVariablePaging
 	s.clientCapabilities.supportsVariableType = args.SupportsVariableType
+	s.clientCapabilities.supportsInvalidatedEvent = args.SupportsInvalidatedEvent
 }
 
 // Default output file pathname for the compiled binary in debug or test modes,
@@ -1994,6 +1996,31 @@ func (s *Server) childrenToDAPVariables(v *fullyQualifiedVariable) ([]dap.Variab
 				NamedVariables:     getNamedVariableCount(&v.Children[i]),
 			}
 		}
+	case reflect.Ptr:
+		c := &v.Children[0]
+		cfqname := fmt.Sprintf("(*%v)", v.fullyQualifiedNameOrExpr)
+
+		cvalue, cvarref := s.convertVariable(c, cfqname)
+		if cvarref > 0 {
+			return s.childrenToDAPVariables(&fullyQualifiedVariable{
+				Variable:                 c,
+				fullyQualifiedNameOrExpr: cfqname,
+			})
+		}
+		name := c.Name
+		if c.Flags&proc.VariableShadowed == proc.VariableShadowed {
+			name = fmt.Sprintf("(%s)", name)
+		}
+
+		return []dap.Variable{{
+			Name:               cfqname,
+			EvaluateName:       cfqname,
+			Type:               s.getTypeIfSupported(c),
+			Value:              cvalue,
+			VariablesReference: cvarref,
+			IndexedVariables:   getIndexedVariableCount(c),
+			NamedVariables:     getNamedVariableCount(c),
+		}}, nil
 	default:
 		children = make([]dap.Variable, len(v.Children))
 		for i := range v.Children {
@@ -2615,6 +2642,11 @@ func (s *Server) onSetVariableRequest(request *dap.SetVariableRequest) {
 	// TODO(hyangah): instead of arg.Value, reload the variable and return
 	// the presentation of the new value.
 	s.send(response)
+	if s.clientCapabilities.supportsInvalidatedEvent {
+		// Multiple variables may have been affected, including on different
+		// goroutines.
+		s.send(&dap.InvalidatedEvent{Event: *newEvent("invalidated")})
+	}
 }
 
 // onSetExpression sends a not-yet-implemented error response.
@@ -2629,7 +2661,7 @@ func (s *Server) onLoadedSourcesRequest(request *dap.LoadedSourcesRequest) {
 	s.sendNotYetImplementedErrorResponse(request.Request)
 }
 
-// onReadMemoryRequest sends a not-yet-implemented error response.
+// onReadMemoryRequest se	nds a not-yet-implemented error response.
 // Capability 'supportsReadMemoryRequest' is not set 'initialize' response.
 func (s *Server) onReadMemoryRequest(request *dap.ReadMemoryRequest) {
 	s.sendNotYetImplementedErrorResponse(request.Request)
