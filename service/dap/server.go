@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1415,9 +1416,9 @@ func (s *Server) onThreadsRequest(request *dap.ThreadsRequest) {
 					Category: "stderr",
 				}})
 		}
-		threads = []dap.Thread{{Id: 1, Name: "Dummy"}}
+		threads = []dap.Thread{{Id: -1, Name: "Dummy"}}
 	} else if len(gs) == 0 {
-		threads = []dap.Thread{{Id: 1, Name: "Dummy"}}
+		threads = []dap.Thread{{Id: -1, Name: "Dummy"}}
 	} else {
 		state, err := s.debugger.State( /*nowait*/ true)
 		if err != nil {
@@ -2614,48 +2615,157 @@ func (s *Server) onReadMemoryRequest(request *dap.ReadMemoryRequest) {
 	s.sendNotYetImplementedErrorResponse(request.Request)
 }
 
-// onDisassembleRequest sends a not-yet-implemented error response.
-// Capability 'supportsDisassembleRequest' is not set 'initialize' response.
+// onDisassembleRequest handles 'disassemble' requests.
+// Capability 'supportsDisassembleRequest' is set in 'initialize' response.
 func (s *Server) onDisassembleRequest(request *dap.DisassembleRequest) {
 	addr, err := strconv.ParseInt(request.Arguments.MemoryReference, 0, 64)
 	if err != nil {
 		s.sendErrorResponse(request.Request, UnableToDisassemble, "Unable to disassemble", err.Error())
 		return
 	}
-	// TODO(suzmue): use instruction count and offset from request.
-	startPc := uint64(addr)
-	procInstructions, err := s.debugger.Disassemble(1, startPc, 0)
+
+	start := uint64(addr)
+	maxInstructionLength := s.debugger.Target().BinInfo().Arch.MaxInstructionLength()
+	offset := request.Arguments.InstructionOffset * maxInstructionLength
+	if offset < 0 {
+		start = uint64(addr + int64(offset))
+	}
+	end := uint64(addr + int64(request.Arguments.InstructionCount*maxInstructionLength))
+
+	// Make sure the PCs are lined up with instructions.
+	start, end = s.alignPCs(start, end)
+
+	// Disassemble the instructions
+	procInstructions, err := s.debugger.Disassemble(-1, start, end)
 	if err != nil {
 		s.sendErrorResponse(request.Request, UnableToDisassemble, "Unable to disassemble", err.Error())
 		return
 	}
 
-	instructions := make([]dap.DisassembledInstruction, request.Arguments.InstructionCount)
-	// lastLine := -1
-	for i := 0; i < len(procInstructions) && i < request.Arguments.InstructionCount; i++ {
-		instruction := api.ConvertAsmInstruction(procInstructions[i], s.debugger.AsmInstructionText(&procInstructions[i], 0))
+	// Find the section of instructions that were requested.
+	ref := -1
+	for i, inst := range procInstructions {
+		if inst.Loc.PC == uint64(addr) {
+			ref = i
+		}
+	}
+	if ref < 0 {
+		s.sendErrorResponse(request.Request, UnableToDisassemble, "Unable to disassemble", "could not find memory reference")
+		return
+	}
+	startIdx := 0
+	if ref+request.Arguments.InstructionOffset > 0 {
+		startIdx = ref + request.Arguments.InstructionOffset
+	}
+	endIdx := ref + request.Arguments.InstructionOffset + request.Arguments.InstructionCount
+	if endIdx > len(procInstructions) {
+		endIdx = len(procInstructions)
+	}
+	if endIdx < startIdx {
+		endIdx = startIdx
+	}
+
+	// Turn the given range of instructions into dap instructions
+	instructions := make([]dap.DisassembledInstruction, endIdx-startIdx)
+	lastFile, lastLine := "", -1
+	for i := 0; i < len(instructions); i++ {
+		instruction := api.ConvertAsmInstruction(procInstructions[startIdx+i], s.debugger.AsmInstructionText(&procInstructions[startIdx+i], proc.GoFlavour))
 		instructions[i] = dap.DisassembledInstruction{
 			Address:          fmt.Sprintf("%#x", instruction.Loc.PC),
 			InstructionBytes: fmt.Sprintf("%x", instruction.Bytes),
 			Instruction:      instruction.Text,
 		}
-		// if instruction's source starts on a new line add the source to instruction
-		// if instruction.Loc.Line != lastLine {
-		// lastLine = instruction.Loc.Line
-		instructions[i].Location = dap.Source{
-			Path: instruction.Loc.File,
+		// Only set the location on the first instruction for a given line.
+		if instruction.Loc.File != lastFile || instruction.Loc.Line != lastLine {
+			instructions[i].Location = dap.Source{Path: instruction.Loc.File}
+			instructions[i].Line = instruction.Loc.Line
+			lastFile, lastLine = instruction.Loc.File, instruction.Loc.Line
 		}
-		instructions[i].Line = instruction.Loc.Line
-		// }
-	}
-	body := dap.DisassembleResponseBody{
-		Instructions: instructions,
 	}
 	response := &dap.DisassembleResponse{
 		Response: *newResponse(request.Request),
-		Body:     body,
+		Body: dap.DisassembleResponseBody{
+			Instructions: instructions,
+		},
 	}
 	s.send(response)
+}
+
+func (s *Server) alignPCs(start, end uint64) (uint64, uint64) {
+	// We want to find the function locations position that would enclose
+	// the range from start to end.
+	//
+	// Example:
+	//
+	// 0x0000	instruction (func1)
+	// 0x0004	instruction (func1)
+	// 0x0008	instruction (func1)
+	// 0x000c	nop
+	// 0x000e	nop
+	// 0x0000	nop
+	// 0x0002	nop
+	// 0x0004	instruction (func2)
+	// 0x0008	instruction (func2)
+	// 0x000c	instruction (func2)
+	//
+	// start values:
+	// < 0x0000			at func1.Entry	=	0x0000
+	// 0x0000-0x000b	at func1.Entry	=	0x0000
+	// 0x000c-0x0003	at func1.End	=	0x000c
+	// 0x0004-0x000f	at func2.Entry	=	0x0004
+	// > 0x000f			at func2.End	=	0x0010
+	//
+	// end values:
+	// < 0x0000			at func1.Entry	=	0x0000
+	// 0x0000-0x000b	at func1.End	=	0x0000
+	// 0x000c-0x0003	at func2.Entry	=	0x000c
+	// 0x0004-0x000f	at func2.End	=	0x0004
+	// > 0x000f			at func2.End	=	0x0004
+
+	bi := s.debugger.Target().BinInfo()
+
+	// Handle start values:
+	fn := bi.PCToFunc(start)
+	if fn != nil {
+		// start is in a funcition.
+		start = fn.Entry
+	} else if b, pc := checkOutOfAddressSpace(start, bi); b {
+		start = pc
+	} else {
+		// Otherwise it must come after some function.
+		i := sort.Search(len(bi.Functions), func(i int) bool {
+			fn := bi.Functions[len(bi.Functions)-(i+1)]
+			return start >= fn.End
+		})
+		start = bi.Functions[len(bi.Functions)-(i+1)].End
+	}
+
+	// Handle end values:
+	if fn := bi.PCToFunc(end); fn != nil {
+		// end is in a funcition.
+		end = fn.End
+	} else if b, pc := checkOutOfAddressSpace(end, bi); b {
+		end = pc
+	} else {
+		// Otherwise it must come before some function.
+		i := sort.Search(len(bi.Functions), func(i int) bool {
+			fn := bi.Functions[i]
+			return end < fn.Entry
+		})
+		end = bi.Functions[i].Entry
+	}
+
+	return start, end
+}
+
+func checkOutOfAddressSpace(pc uint64, bi *proc.BinaryInfo) (bool, uint64) {
+	if pc < bi.Functions[0].Entry {
+		return true, bi.Functions[0].Entry
+	}
+	if pc >= bi.Functions[len(bi.Functions)-1].End {
+		return true, bi.Functions[len(bi.Functions)-1].End
+	}
+	return false, pc
 }
 
 // onCancelRequest sends a not-yet-implemented error response.
