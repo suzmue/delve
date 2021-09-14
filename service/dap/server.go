@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -715,6 +716,9 @@ func (s *Server) onInitializeRequest(request *dap.InitializeRequest) {
 	response.Body.SupportsSetVariable = true
 	response.Body.SupportsEvaluateForHovers = true
 	response.Body.SupportsClipboardContext = true
+	response.Body.SupportsDisassembleRequest = true
+	response.Body.SupportsSteppingGranularity = true
+	response.Body.SupportsInstructionBreakpoints = true
 	// TODO(polina): support these requests in addition to vscode-go feature parity
 	response.Body.SupportsTerminateRequest = false
 	response.Body.SupportsRestartRequest = false
@@ -722,7 +726,6 @@ func (s *Server) onInitializeRequest(request *dap.InitializeRequest) {
 	response.Body.SupportsSetExpression = false
 	response.Body.SupportsLoadedSourcesRequest = false
 	response.Body.SupportsReadMemoryRequest = false
-	response.Body.SupportsDisassembleRequest = false
 	response.Body.SupportsCancelRequest = false
 	s.send(response)
 }
@@ -1499,21 +1502,33 @@ func (s *Server) onAttachRequest(request *dap.AttachRequest) {
 // This is a mandatory request to support.
 func (s *Server) onNextRequest(request *dap.NextRequest, asyncSetupDone chan struct{}) {
 	s.sendStepResponse(request.Arguments.ThreadId, &dap.NextResponse{Response: *newResponse(request.Request)})
-	s.doStepCommand(api.Next, request.Arguments.ThreadId, asyncSetupDone)
+	cmd := api.Next
+	if request.Arguments.Granularity == "instruction" {
+		cmd = api.StepInstruction
+	}
+	s.doStepCommand(cmd, request.Arguments.ThreadId, asyncSetupDone)
 }
 
 // onStepInRequest handles 'stepIn' request
 // This is a mandatory request to support.
 func (s *Server) onStepInRequest(request *dap.StepInRequest, asyncSetupDone chan struct{}) {
 	s.sendStepResponse(request.Arguments.ThreadId, &dap.StepInResponse{Response: *newResponse(request.Request)})
-	s.doStepCommand(api.Step, request.Arguments.ThreadId, asyncSetupDone)
+	cmd := api.Step
+	if request.Arguments.Granularity == "instruction" {
+		cmd = api.StepInstruction
+	}
+	s.doStepCommand(cmd, request.Arguments.ThreadId, asyncSetupDone)
 }
 
 // onStepOutRequest handles 'stepOut' request
 // This is a mandatory request to support.
 func (s *Server) onStepOutRequest(request *dap.StepOutRequest, asyncSetupDone chan struct{}) {
 	s.sendStepResponse(request.Arguments.ThreadId, &dap.StepOutResponse{Response: *newResponse(request.Request)})
-	s.doStepCommand(api.StepOut, request.Arguments.ThreadId, asyncSetupDone)
+	cmd := api.StepOut
+	if request.Arguments.Granularity == "instruction" {
+		cmd = api.StepInstruction
+	}
+	s.doStepCommand(cmd, request.Arguments.ThreadId, asyncSetupDone)
 }
 
 func (s *Server) sendStepResponse(threadId int, message dap.Message) {
@@ -1641,6 +1656,7 @@ func (s *Server) onStackTraceRequest(request *dap.StackTraceRequest) {
 		if !isSystemGoroutine && packageName == "runtime" {
 			stackFrame.Source.PresentationHint = "deemphasize"
 		}
+		stackFrame.InstructionPointerReference = fmt.Sprintf("%#x", loc.PC)
 		stackFrames = append(stackFrames, stackFrame)
 	}
 
@@ -2417,7 +2433,11 @@ func (s *Server) onRestartRequest(request *dap.RestartRequest) {
 // This is an optional request enabled by capability ‘supportsStepBackRequest’.
 func (s *Server) onStepBackRequest(request *dap.StepBackRequest, asyncSetupDone chan struct{}) {
 	s.sendStepResponse(request.Arguments.ThreadId, &dap.StepBackResponse{Response: *newResponse(request.Request)})
-	s.doStepCommand(api.ReverseNext, request.Arguments.ThreadId, asyncSetupDone)
+	cmd := api.Step
+	if request.Arguments.Granularity == "instruction" {
+		cmd = api.ReverseStepInstruction
+	}
+	s.doStepCommand(cmd, request.Arguments.ThreadId, asyncSetupDone)
 }
 
 // onReverseContinueRequest performs a rewind command call up to the previous
@@ -2563,7 +2583,45 @@ func (s *Server) onReadMemoryRequest(request *dap.ReadMemoryRequest) {
 // onDisassembleRequest sends a not-yet-implemented error response.
 // Capability 'supportsDisassembleRequest' is not set 'initialize' response.
 func (s *Server) onDisassembleRequest(request *dap.DisassembleRequest) {
-	s.sendNotYetImplementedErrorResponse(request.Request)
+	addr, err := strconv.ParseInt(request.Arguments.MemoryReference, 0, 64)
+	if err != nil {
+		s.sendErrorResponse(request.Request, UnableToDisassemble, "Unable to disassemble", err.Error())
+		return
+	}
+	// TODO(suzmue): use instruction count and offset from request.
+	startPc := uint64(addr)
+	procInstructions, err := s.debugger.Disassemble(1, startPc, 0)
+	if err != nil {
+		s.sendErrorResponse(request.Request, UnableToDisassemble, "Unable to disassemble", err.Error())
+		return
+	}
+
+	instructions := make([]dap.DisassembledInstruction, request.Arguments.InstructionCount)
+	lastLine := -1
+	for i := 0; i < len(procInstructions) && i < request.Arguments.InstructionCount; i++ {
+		instruction := api.ConvertAsmInstruction(procInstructions[i], s.debugger.AsmInstructionText(&procInstructions[i], 0))
+		instructions[i] = dap.DisassembledInstruction{
+			Address:          fmt.Sprintf("%#x", instruction.Loc.PC),
+			InstructionBytes: fmt.Sprintf("%x", instruction.Bytes),
+			Instruction:      instruction.Text,
+		}
+		// if instruction's source starts on a new line add the source to instruction
+		if instruction.Loc.Line != lastLine {
+			lastLine = instruction.Loc.Line
+			instructions[i].Location = dap.Source{
+				Path: instruction.Loc.File,
+			}
+			instructions[i].Line = instruction.Loc.Line
+		}
+	}
+	body := dap.DisassembleResponseBody{
+		Instructions: instructions,
+	}
+	response := &dap.DisassembleResponse{
+		Response: *newResponse(request.Request),
+		Body:     body,
+	}
+	s.send(response)
 }
 
 // onCancelRequest sends a not-yet-implemented error response.
