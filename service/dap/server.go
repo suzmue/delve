@@ -622,6 +622,9 @@ func (s *Server) handleRequest(request dap.Message) {
 	case *dap.ExceptionInfoRequest:
 		// Optional (capability ‘supportsExceptionInfoRequest’)
 		s.onExceptionInfoRequest(request)
+	case *dap.SetInstructionBreakpointsRequest:
+		// Optional (capability ‘supportsInstructionBreakpoints’)
+		s.onSetInstructionBreakpoints(request)
 	//--- Requests that we do not plan to support ---
 	case *dap.RestartFrameRequest:
 		// Optional (capability ’supportsRestartFrame’)
@@ -1134,6 +1137,7 @@ func updateBreakpointsResponse(breakpoints []dap.Breakpoint, i int, err error, g
 		breakpoints[i].Id = got.ID
 		breakpoints[i].Line = got.Line
 		breakpoints[i].Source = dap.Source{Name: filepath.Base(path), Path: path}
+		breakpoints[i].InstructionReference = fmt.Sprintf("%#x", got.Addr)
 	}
 }
 
@@ -1284,6 +1288,36 @@ func (s *Server) getMatchingBreakpoints(prefix string) map[string]*api.Breakpoin
 		matchingBps[bp.Name] = bp
 	}
 	return matchingBps
+}
+
+const instructionBpPrefix = "instructionBreakpoint"
+
+func (s *Server) onSetInstructionBreakpoints(request *dap.SetInstructionBreakpointsRequest) {
+	breakpoints := make([]dap.Breakpoint, len(request.Arguments.Breakpoints))
+
+	for i, want := range request.Arguments.Breakpoints {
+		reqString := fmt.Sprintf("%s PC=%s", instructionBpPrefix, want.InstructionReference)
+		addr, err := strconv.ParseInt(want.InstructionReference, 0, 64)
+		if err != nil {
+			breakpoints[i].Message = err.Error()
+			continue
+		}
+
+		got, err := s.debugger.CreateBreakpoint(&api.Breakpoint{Addr: uint64(addr), Cond: want.Condition, Name: reqString})
+		if err != nil {
+			breakpoints[i].Message = err.Error()
+			continue
+		}
+		var clientPath string
+		if got != nil {
+			clientPath = s.toClientPath(got.File)
+		}
+		updateBreakpointsResponse(breakpoints, i, err, got, clientPath)
+	}
+
+	response := &dap.SetInstructionBreakpointsResponse{Response: *newResponse(request.Request)}
+	response.Body.Breakpoints = breakpoints
+	s.send(response)
 }
 
 func (s *Server) onSetExceptionBreakpointsRequest(request *dap.SetExceptionBreakpointsRequest) {
@@ -1654,7 +1688,7 @@ func (s *Server) onStackTraceRequest(request *dap.StackTraceRequest) {
 
 		packageName := fnPackageName(loc)
 		if !isSystemGoroutine && packageName == "runtime" {
-			stackFrame.Source.PresentationHint = "deemphasize"
+			stackFrame.PresentationHint = "subtle"
 		}
 		stackFrame.InstructionPointerReference = fmt.Sprintf("%#x", loc.PC)
 		stackFrames = append(stackFrames, stackFrame)
@@ -2597,7 +2631,7 @@ func (s *Server) onDisassembleRequest(request *dap.DisassembleRequest) {
 	}
 
 	instructions := make([]dap.DisassembledInstruction, request.Arguments.InstructionCount)
-	lastLine := -1
+	// lastLine := -1
 	for i := 0; i < len(procInstructions) && i < request.Arguments.InstructionCount; i++ {
 		instruction := api.ConvertAsmInstruction(procInstructions[i], s.debugger.AsmInstructionText(&procInstructions[i], 0))
 		instructions[i] = dap.DisassembledInstruction{
@@ -2606,13 +2640,13 @@ func (s *Server) onDisassembleRequest(request *dap.DisassembleRequest) {
 			Instruction:      instruction.Text,
 		}
 		// if instruction's source starts on a new line add the source to instruction
-		if instruction.Loc.Line != lastLine {
-			lastLine = instruction.Loc.Line
-			instructions[i].Location = dap.Source{
-				Path: instruction.Loc.File,
-			}
-			instructions[i].Line = instruction.Loc.Line
+		// if instruction.Loc.Line != lastLine {
+		// lastLine = instruction.Loc.Line
+		instructions[i].Location = dap.Source{
+			Path: instruction.Loc.File,
 		}
+		instructions[i].Line = instruction.Loc.Line
+		// }
 	}
 	body := dap.DisassembleResponseBody{
 		Instructions: instructions,
@@ -2911,6 +2945,8 @@ func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
 			}
 			if strings.HasPrefix(state.CurrentThread.Breakpoint.Name, functionBpPrefix) {
 				stopped.Body.Reason = "function breakpoint"
+			} else if strings.HasPrefix(state.CurrentThread.Breakpoint.Name, instructionBpPrefix) {
+				stopped.Body.Reason = "instruction breakpoint"
 			}
 			stopped.Body.HitBreakpointIds = []int{state.CurrentThread.Breakpoint.ID}
 		}
