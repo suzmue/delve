@@ -3849,6 +3849,30 @@ func TestNextAndStep(t *testing.T) {
 	})
 }
 
+func TestHardCodedBreakpoints(t *testing.T) {
+	runTest(t, "consts", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			fixture.Source, []int{28},
+			[]onBreakpoint{{ // Stop at line 28
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 28)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+					se := client.ExpectStoppedEvent(t)
+					if se.Body.ThreadId != 1 || se.Body.Reason != "breakpoint" {
+						t.Errorf("\ngot  %#v\nwant ThreadId=1 Reason=\"breakpoint\"", se)
+					}
+				},
+				disconnect: false,
+			}})
+	})
+}
+
 // TestStepInstruction executes to a breakpoint and tests stepping
 // a single instruction
 func TestStepInstruction(t *testing.T) {
