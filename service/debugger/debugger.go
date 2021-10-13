@@ -1277,6 +1277,60 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
 	return state, err
 }
 
+// Command handles commands which control the debugger lifecycle
+func (d *Debugger) StepOutHardCoded(threadId int, resumeNotify chan struct{}) (*api.DebuggerState, error) {
+	var err error
+	withBreakpointInfo := true
+
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+
+	d.setRunning(true)
+	defer d.setRunning(false)
+	d.target.ResumeNotify(resumeNotify)
+
+	d.log.Debugf("switching to thread %d", threadId)
+	currentThread := d.target.CurrentThread()
+	defer d.target.SwitchThread(currentThread.ThreadID())
+	err = d.target.SwitchThread(threadId)
+	if err != nil {
+		return nil, err
+	}
+
+	err = d.target.StepOutHardCoded()
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		if pe, ok := err.(proc.ErrProcessExited); ok {
+			state := &api.DebuggerState{}
+			state.Pid = d.target.Pid()
+			state.Exited = true
+			state.ExitStatus = pe.Status
+			state.Err = pe
+			return state, nil
+		}
+		return nil, err
+	}
+	state, stateErr := d.state(api.LoadConfigToProc(&api.LoadConfig{}))
+	if stateErr != nil {
+		return state, stateErr
+	}
+	if withBreakpointInfo {
+		err = d.collectBreakpointInformation(state)
+	}
+	for _, th := range state.Threads {
+		if th.Breakpoint != nil && th.Breakpoint.TraceReturn {
+			for _, v := range th.BreakpointInfo.Arguments {
+				if (v.Flags & api.VariableReturnArgument) != 0 {
+					th.ReturnValues = append(th.ReturnValues, v)
+				}
+			}
+		}
+	}
+	return state, err
+}
+
 func (d *Debugger) collectBreakpointInformation(state *api.DebuggerState) error {
 	if state == nil {
 		return nil

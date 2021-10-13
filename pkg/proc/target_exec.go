@@ -139,16 +139,7 @@ func (dbp *Target) Continue() error {
 
 			switch {
 			case loc.Fn.Name == "runtime.breakpoint":
-				// In linux-arm64, PtraceSingleStep seems cannot step over BRK instruction
-				// (linux-arm64 feature or kernel bug maybe).
-				if !arch.BreakInstrMovesPC() {
-					setPC(curthread, loc.PC+uint64(arch.BreakpointSize()))
-				}
-				// Single-step current thread until we exit runtime.breakpoint and
-				// runtime.Breakpoint.
-				// On go < 1.8 it was sufficient to single-step twice on go1.8 a change
-				// to the compiler requires 4 steps.
-				if err := stepInstructionOut(dbp, curthread, "runtime.breakpoint", "runtime.Breakpoint"); err != nil {
+				if err := dbp.stepOutHardCoded(); err != nil {
 					return err
 				}
 				dbp.StopReason = StopHardcodedBreakpoint
@@ -230,6 +221,35 @@ func (dbp *Target) Continue() error {
 			return conditionErrors(threads)
 		}
 	}
+}
+
+// Next continues execution until the next source line.
+func (dbp *Target) StepOutHardCoded() (err error) {
+	if _, err := dbp.Valid(); err != nil {
+		return err
+	}
+	return dbp.stepOutHardCoded()
+}
+
+func (dbp *Target) stepOutHardCoded() error {
+	curthread := dbp.CurrentThread()
+	loc, err := curthread.Location()
+	if err != nil || loc.Fn == nil {
+		return nil
+	}
+	// In linux-arm64, PtraceSingleStep seems cannot step over BRK instruction
+	// (linux-arm64 feature or kernel bug maybe).
+	if !dbp.BinInfo().Arch.BreakInstrMovesPC() {
+		setPC(curthread, loc.PC+uint64(dbp.BinInfo().Arch.BreakpointSize()))
+	}
+	// Single-step current thread until we exit runtime.breakpoint and
+	// runtime.Breakpoint.
+	// On go < 1.8 it was sufficient to single-step twice on go1.8 a change
+	// to the compiler requires 4 steps.
+	if err := stepInstructionOut(dbp, curthread, "runtime.breakpoint", "runtime.Breakpoint"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func conditionErrors(threads []Thread) error {

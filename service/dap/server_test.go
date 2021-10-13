@@ -2990,6 +2990,54 @@ func TestConcurrentBreakpointsLogPoints(t *testing.T) {
 				disconnect: false,
 			}})
 	})
+	runTest(t, "goroutinebreak", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{12},
+			[]onBreakpoint{{
+				// Stop at line 12
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 12)
+					bps := []int{8}
+					logMessages := map[int]string{8: "hello"}
+					client.SetBreakpointsRequestWithArgs(fixture.Source, bps, nil, nil, logMessages)
+					client.ExpectSetBreakpointsResponse(t)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+
+					// There may be up to 1 breakpoint and any number of log points that are
+					// hit concurrently. We should get a stopped event everytime the breakpoint
+					// is hit and an output event for each log point hit.
+					var oeCount, seCount int
+					for oeCount < 10 || seCount < 10 {
+						switch m := client.ExpectMessage(t).(type) {
+						case *dap.StoppedEvent:
+							if m.Body.Reason != "breakpoint" || !m.Body.AllThreadsStopped || m.Body.ThreadId != 1 {
+								t.Errorf("\ngot  %#v\nwant Reason='breakpoint' AllThreadsStopped=true ThreadId=1", m)
+							}
+							// This could be in main.main or runtime.breakpoint.
+							seCount++
+							client.ContinueRequest(1)
+						case *dap.OutputEvent:
+							checkLogMessage(t, m, -1, "hello", fixture.Source, 8)
+							oeCount++
+						case *dap.ContinueResponse:
+						case *dap.TerminatedEvent:
+							t.Fatalf("\nexpected 10 output events and 10 stopped events, got %d output events and %d stopped events", oeCount, seCount)
+						default:
+							t.Fatalf("Unexpected message type: expect StoppedEvent, OutputEvent, or ContinueResponse, got %#v", m)
+						}
+					}
+					client.ExpectTerminatedEvent(t)
+				},
+				disconnect: false,
+			}})
+	})
 }
 
 func TestSetBreakpointWhileRunning(t *testing.T) {
