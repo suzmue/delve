@@ -1602,9 +1602,9 @@ func (s *Session) onThreadsRequest(request *dap.ThreadsRequest) {
 					Category: "stderr",
 				}})
 		}
-		threads = []dap.Thread{{Id: 1, Name: "Dummy"}}
+		threads = []dap.Thread{{Id: -1, Name: "Current"}}
 	} else if len(gs) == 0 {
-		threads = []dap.Thread{{Id: 1, Name: "Dummy"}}
+		threads = []dap.Thread{{Id: -1, Name: "Current"}}
 	} else {
 		state, err := s.debugger.State( /*nowait*/ true)
 		if err != nil {
