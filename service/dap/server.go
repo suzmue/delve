@@ -1027,11 +1027,15 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 		}
 		args.DlvCwd, _ = filepath.Abs(args.DlvCwd)
 		s.config.log.Debugf("building from %q: [%s]", args.DlvCwd, cmd)
-		if err != nil {
+		if len(out) > 0 {
+			var errString string
+			if err != nil {
+				errString = fmt.Sprintf(" (%s)", err.Error())
+			}
 			s.send(&dap.OutputEvent{
 				Event: *newEvent("output"),
 				Body: dap.OutputEventBody{
-					Output:   fmt.Sprintf("Build Error: %s\n%s (%s)\n", cmd, strings.TrimSpace(string(out)), err.Error()),
+					Output:   fmt.Sprintf("Build Error: %s\n%s%s\n", cmd, strings.TrimSpace(string(out)), errString),
 					Category: "stderr",
 				}})
 			// Users are used to checking the Debug Console for build errors.

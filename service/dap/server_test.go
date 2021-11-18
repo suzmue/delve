@@ -6050,6 +6050,14 @@ func TestBadLaunchRequests(t *testing.T) {
 		}
 		checkFailedToLaunchWithMessage(client.ExpectInvisibleErrorResponse(t), "Failed to launch: Build error: Check the debug console for details.")
 
+		// Not a test file
+		client.LaunchRequest("test", fixture.Source, !stopOnEntry)
+		oe = client.ExpectOutputEvent(t)
+		if !strings.HasPrefix(oe.Body.Output, "Build Error: ") || oe.Body.Category != "stderr" {
+			t.Errorf("got %#v, want Category=\"stderr\" Output=\"Build Error: ...\"", oe)
+		}
+		checkFailedToLaunchWithMessage(client.ExpectInvisibleErrorResponse(t), "Failed to launch: Build error: Check the debug console for details.")
+
 		// Bad "cwd"
 		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "noDebug": false, "cwd": "dir/invalid"})
 		checkFailedToLaunch(client.ExpectVisibleErrorResponse(t)) // invalid directory, the error message is system-dependent.
