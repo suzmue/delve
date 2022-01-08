@@ -2728,6 +2728,10 @@ func TestSetBreakpoint(t *testing.T) {
 
 					// Set at a line without a statement
 					client.SetBreakpointsRequest(fixture.Source, []int{1000})
+					oe := client.ExpectOutputEvent(t)
+					if !strings.HasPrefix(oe.Body.Output, "could not find statement") {
+						t.Errorf("\n got %#v, want Output=%q", oe, "could not find statement")
+					}
 					expectSetBreakpointsResponse(t, client, []Breakpoint{{-1, "", false, "could not find statement"}}) // all cleared, none set
 				},
 				// The program has an infinite loop, so we must kill it by disconnecting.

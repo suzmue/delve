@@ -1325,6 +1325,18 @@ func (s *Session) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
 	clientPath := request.Arguments.Source.Path
 	serverPath := s.toServerPath(clientPath)
 
+	// Verify that the file is in this program.
+	sources, err := s.debugger.Sources(serverPath)
+	if err != nil || len(sources) == 0 {
+		response := &dap.SetBreakpointsResponse{Response: *newResponse(request.Request)}
+		response.Body.Breakpoints = make([]dap.Breakpoint, len(request.Arguments.Breakpoints))
+		for i := 0; i < len(response.Body.Breakpoints); i++ {
+			response.Body.Breakpoints[i].Message = fmt.Sprintf("source not found in program: %q", serverPath)
+		}
+		s.send(response)
+		return
+	}
+
 	// Get all existing breakpoints that match for this source.
 	sourceRequestPrefix := fmt.Sprintf("sourceBp Path=%q ", request.Arguments.Source.Path)
 
@@ -1338,6 +1350,23 @@ func (s *Session) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
 		}
 	}, func(i int) (*bpLocation, error) {
 		want := request.Arguments.Breakpoints[i]
+		// TODO(suzmue): verify the line is appropriate
+		fileName := serverPath
+		if runtime.GOOS == "windows" {
+			// Accept fileName which is case-insensitive and slash-insensitive match
+			fileNameNormalized := strings.ToLower(filepath.ToSlash(fileName))
+			for _, symFile := range s.debugger.Target().BinInfo().Sources {
+				if fileNameNormalized == strings.ToLower(filepath.ToSlash(symFile)) {
+					fileName = symFile
+					break
+				}
+			}
+		}
+		_, err = proc.FindFileLocation(s.debugger.Target(), fileName, want.Line)
+		if err != nil {
+			s.logToConsole(err.Error())
+			return nil, err
+		}
 		return &bpLocation{
 			file: serverPath,
 			line: want.Line,
