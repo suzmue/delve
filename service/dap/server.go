@@ -2558,7 +2558,7 @@ func (s *Session) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr 
 		}
 		return s.variableHandles.create(&fullyQualifiedVariable{v, qualifiedNameOrExpr, false /*not a scope*/, 0})
 	}
-	value = api.ConvertVar(v).SinglelineString()
+	value = api.ConvertVar(v).SinglelineStringTypes(false)
 	if v.Unreadable != nil {
 		return value, 0
 	}
@@ -2572,7 +2572,7 @@ func (s *Session) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr 
 		// TODO(polina): Get *proc.Variable object from debugger instead. Export a function to set v.loaded to false
 		// and call v.loadValue gain with a different load config. It's more efficient, and it's guaranteed to keep
 		// working with generics.
-		value = api.ConvertVar(v).SinglelineString()
+		value = api.ConvertVar(v).SinglelineStringTypes(false)
 		typeName := api.PrettyTypeName(v.DwarfType)
 		loadExpr := fmt.Sprintf("*(*%q)(%#x)", typeName, v.Addr)
 		s.config.log.Debugf("loading %s (type %s) with %s", qualifiedNameOrExpr, typeName, loadExpr)
@@ -2586,7 +2586,7 @@ func (s *Session) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr 
 		} else {
 			v.Children = vLoaded.Children
 			v.Value = vLoaded.Value
-			value = api.ConvertVar(v).SinglelineString()
+			value = api.ConvertVar(v).SinglelineStringTypes(false)
 		}
 		return value
 	}
