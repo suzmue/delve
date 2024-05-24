@@ -230,6 +230,10 @@ type launchAttachArgs struct {
 	substitutePathClientToServer [][2]string `cfgName:"substitutePath"`
 	// substitutePathServerToClient indicates rules for converting file paths between debugger and client.
 	substitutePathServerToClient [][2]string
+
+	// Experimental to use for path mapping.
+	localGOROOT, localGOMODCACHE string
+	localModuleRootDirToPath     [][2]string
 }
 
 // defaultArgs borrows the defaults for the arguments from the original vscode-go adapter.
@@ -245,6 +249,9 @@ var defaultArgs = launchAttachArgs{
 	ShowPprofLabels:              []string{},
 	substitutePathClientToServer: [][2]string{},
 	substitutePathServerToClient: [][2]string{},
+	localGOROOT:                  "",
+	localGOMODCACHE:              "",
+	localModuleRootDirToPath:     [][2]string{},
 }
 
 // dapClientCapabilities captures arguments from initialize request that
@@ -365,6 +372,14 @@ func (s *Session) setLaunchAttachArgs(args LaunchAttachCommonConfig) {
 		}
 		s.args.substitutePathClientToServer = clientToServer
 		s.args.substitutePathServerToClient = serverToClient
+	}
+	s.args.localGOROOT, s.args.localGOMODCACHE = args.LocalGOROOT, args.LocalGOMODCACHE
+	if roots := args.LocalModuleRoots; len(roots) > 0 { // TODO: sort by length
+		localModuleRoots := make([][2]string, 0, len(roots))
+		for _, p := range roots {
+			localModuleRoots = append(localModuleRoots, [2]string{p.Dir, p.Path})
+		}
+		s.args.localModuleRootDirToPath = localModuleRoots
 	}
 }
 
@@ -3892,6 +3907,10 @@ func (msg *logMessage) evaluate(s *Session, goid int64) string {
 }
 
 func (s *Session) toClientPath(path string) string {
+	if s.args.localGOROOT != "" && len(s.args.substitutePathClientToServer) == 0 {
+		s.fillSubstitutePath()
+	}
+
 	if len(s.args.substitutePathServerToClient) == 0 {
 		return path
 	}
@@ -3903,6 +3922,10 @@ func (s *Session) toClientPath(path string) string {
 }
 
 func (s *Session) toServerPath(path string) string {
+	if s.args.localGOROOT != "" && len(s.args.substitutePathClientToServer) == 0 {
+		s.fillSubstitutePath()
+	}
+
 	if len(s.args.substitutePathClientToServer) == 0 {
 		return path
 	}
@@ -3911,6 +3934,65 @@ func (s *Session) toServerPath(path string) string {
 		s.config.log.Debugf("client path=%s converted to server path=%s\n", path, serverPath)
 	}
 	return serverPath
+}
+
+func (s *Session) fillSubstitutePath() {
+	bi := s.debugger.ListPackagesBuildInfo(false)
+
+	pathMappings := make(map[string]string)
+
+	var serverGOROOT, serverGOMODCACHE string
+	// Find server GOROOT.
+	for _, pkg := range bi {
+		if pkg.ImportPath != "runtime" {
+			continue
+		}
+		// We can use filepath since this is on the remote maching where delve is executing.
+		serverGOROOT = filepath.Dir(filepath.Dir(pkg.DirectoryPath)) // remove src/runtime
+		pathMappings[s.args.localGOROOT] = serverGOROOT
+		break
+	}
+
+	// Find server GOMODCACHE.
+	for _, pkg := range bi {
+		// Check if the directory path looks like GOMODCACHE
+		// also check for part of importpath
+		if !strings.Contains(pkg.DirectoryPath, "@v") {
+			continue
+		}
+		serverGOMODCACHE = pkg.DirectoryPath[:strings.Index(pkg.DirectoryPath, pkg.ImportPath[:strings.Index(pkg.ImportPath, "/")])]
+		pathMappings[s.args.localGOMODCACHE] = serverGOMODCACHE
+		break
+	}
+
+	for _, pkg := range bi {
+		if strings.HasPrefix(pkg.DirectoryPath, serverGOROOT) || strings.HasPrefix(pkg.DirectoryPath, serverGOMODCACHE) {
+			continue
+		}
+		// This is in a main package (or vendor dir in a main package).
+		// TODO what if only main? Look at dirs for all roots and find longest suffix match?
+		for _, root := range s.args.localModuleRootDirToPath {
+			if trim := strings.TrimPrefix(pkg.ImportPath, root[1]); len(trim) < len(pkg.ImportPath) {
+				// TODO: deal with different separators.
+				pathMappings[root[0]] = strings.TrimSuffix(pkg.DirectoryPath, trim)
+				break
+			}
+		}
+	}
+
+	// TODO: replace instead of add
+	var clientToServer, serverToClient = make([][2]string, 0, len(pathMappings)), make([][2]string, 0, len(pathMappings))
+	for local, server := range pathMappings {
+		clientToServer = append(clientToServer, [2]string{local, server})
+		serverToClient = append(serverToClient, [2]string{server, local})
+	}
+	sort.Slice(clientToServer, func(i, j int) bool {
+		return len(clientToServer) > len(clientToServer[j][0])
+	})
+	sort.Slice(serverToClient, func(i, j int) bool {
+		return len(serverToClient[i][0]) > len(serverToClient[j][0])
+	})
+	s.args.substitutePathClientToServer, s.args.substitutePathServerToClient = clientToServer, serverToClient
 }
 
 type logMessage struct {

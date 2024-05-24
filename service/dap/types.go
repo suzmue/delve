@@ -202,6 +202,10 @@ type LaunchAttachCommonConfig struct {
 	// The debug adapter will replace the local path with the remote path in all of the calls.
 	// See also Documentation/cli/substitutepath.md.
 	SubstitutePath []SubstitutePath `json:"substitutePath,omitempty"`
+
+	LocalGOROOT, LocalGOMODCACHE string
+
+	LocalModuleRoots []ModuleRoot
 }
 
 // SubstitutePath defines a mapping from a local path to the remote path.
@@ -213,6 +217,14 @@ type SubstitutePath struct {
 	From string `json:"from,omitempty"`
 	// The remote path to be replaced when passing paths back to the client.
 	To string `json:"to,omitempty"`
+}
+
+// ModuleRoot defines a mapping from a local directory to the module path.
+type ModuleRoot struct {
+	// The local directory to be replaced when passing paths to the debugger.
+	Dir string `json:"dir,omitempty"`
+	// The module path to be used to find module in the source.
+	Path string `json:"path,omitempty"`
 }
 
 func (m *SubstitutePath) UnmarshalJSON(data []byte) error {
