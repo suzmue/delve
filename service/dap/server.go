@@ -779,7 +779,7 @@ func (s *Session) handleRequest(request dap.Message) {
 	case *dap.TerminateThreadsRequest: // Optional (capability 'supportsTerminateThreadsRequest')
 		s.sendUnsupportedErrorResponse(request.Request)
 	case *dap.StepInTargetsRequest: // Optional (capability 'supportsStepInTargetsRequest')
-		s.sendUnsupportedErrorResponse(request.Request)
+		s.onStepInTargetsRequest(request)
 	case *dap.GotoTargetsRequest: // Optional (capability 'supportsGotoTargetsRequest')
 		s.sendUnsupportedErrorResponse(request.Request)
 	case *dap.CompletionsRequest: // Optional (capability 'supportsCompletionsRequest')
@@ -855,6 +855,7 @@ func (s *Session) onInitializeRequest(request *dap.InitializeRequest) {
 	response.Body.SupportsSteppingGranularity = true
 	response.Body.SupportsLogPoints = true
 	response.Body.SupportsDisassembleRequest = true
+	response.Body.SupportsStepInTargetsRequest = true
 	// To be enabled by CapabilitiesEvent based on launch configuration
 	response.Body.SupportsStepBack = false
 	response.Body.SupportTerminateDebuggee = false
@@ -1682,7 +1683,7 @@ func (s *Session) onConfigurationDoneRequest(request *dap.ConfigurationDoneReque
 	s.send(&dap.ConfigurationDoneResponse{Response: *newResponse(request.Request)})
 
 	if !s.args.stopOnEntry {
-		s.runUntilStopAndNotify(api.Continue, allowNextStateChange)
+		s.runUntilStopAndNotify(api.Continue, 0, allowNextStateChange)
 	}
 }
 
@@ -1693,7 +1694,7 @@ func (s *Session) onContinueRequest(request *dap.ContinueRequest, allowNextState
 		Response: *newResponse(request.Request),
 		Body:     dap.ContinueResponseBody{AllThreadsContinued: true},
 	})
-	s.runUntilStopAndNotify(api.Continue, allowNextStateChange)
+	s.runUntilStopAndNotify(api.Continue, 0, allowNextStateChange)
 }
 
 func fnName(loc *proc.Location) string {
@@ -1973,25 +1974,44 @@ func (s *Session) onAttachRequest(request *dap.AttachRequest) {
 	s.send(&dap.AttachResponse{Response: *newResponse(request.Request)})
 }
 
+func (s *Session) onStepInTargetsRequest(request *dap.StepInTargetsRequest) {
+	instrs := s.debugger.StepInTargets()
+	targets := make([]dap.StepInTarget, len(instrs))
+	for i, instr := range instrs {
+		targets[i] = dap.StepInTarget{
+			Id:     int(instr.Loc.PC),
+			Label:  instr.DestLoc.Fn.Name,
+			Line:   instr.Loc.Line,
+			Column: i,
+		}
+	}
+	s.send(&dap.StepInTargetsResponse{
+		Response: *newResponse(request.Request),
+		Body: dap.StepInTargetsResponseBody{
+			Targets: targets,
+		},
+	})
+}
+
 // onNextRequest handles 'next' request.
 // This is a mandatory request to support.
 func (s *Session) onNextRequest(request *dap.NextRequest, allowNextStateChange *syncflag) {
 	s.sendStepResponse(request.Arguments.ThreadId, &dap.NextResponse{Response: *newResponse(request.Request)})
-	s.stepUntilStopAndNotify(api.Next, request.Arguments.ThreadId, request.Arguments.Granularity, allowNextStateChange)
+	s.stepUntilStopAndNotify(api.Next, request.Arguments.ThreadId, request.Arguments.Granularity, 0, allowNextStateChange)
 }
 
 // onStepInRequest handles 'stepIn' request
 // This is a mandatory request to support.
 func (s *Session) onStepInRequest(request *dap.StepInRequest, allowNextStateChange *syncflag) {
 	s.sendStepResponse(request.Arguments.ThreadId, &dap.StepInResponse{Response: *newResponse(request.Request)})
-	s.stepUntilStopAndNotify(api.Step, request.Arguments.ThreadId, request.Arguments.Granularity, allowNextStateChange)
+	s.stepUntilStopAndNotify(api.Step, request.Arguments.ThreadId, request.Arguments.Granularity, request.Arguments.TargetId, allowNextStateChange)
 }
 
 // onStepOutRequest handles 'stepOut' request
 // This is a mandatory request to support.
 func (s *Session) onStepOutRequest(request *dap.StepOutRequest, allowNextStateChange *syncflag) {
 	s.sendStepResponse(request.Arguments.ThreadId, &dap.StepOutResponse{Response: *newResponse(request.Request)})
-	s.stepUntilStopAndNotify(api.StepOut, request.Arguments.ThreadId, request.Arguments.Granularity, allowNextStateChange)
+	s.stepUntilStopAndNotify(api.StepOut, request.Arguments.ThreadId, request.Arguments.Granularity, 0, allowNextStateChange)
 }
 
 func (s *Session) sendStepResponse(threadId int, message dap.Message) {
@@ -2046,9 +2066,10 @@ func (s *Session) stoppedOnBreakpointGoroutineID(state *api.DebuggerState) (int6
 // a channel that will be closed to signal that an
 // asynchronous command has completed setup or was interrupted
 // due to an error, so the server is ready to receive new requests.
-func (s *Session) stepUntilStopAndNotify(command string, threadId int, granularity dap.SteppingGranularity, allowNextStateChange *syncflag) {
+func (s *Session) stepUntilStopAndNotify(command string, threadId int, granularity dap.SteppingGranularity, targetId int, allowNextStateChange *syncflag) {
 	defer allowNextStateChange.raise()
-	_, err := s.debugger.Command(&api.DebuggerCommand{Name: api.SwitchGoroutine, GoroutineID: int64(threadId)}, nil)
+
+	_, err := s.debugger.CommandWithTarget(&api.DebuggerCommand{Name: api.SwitchGoroutine, GoroutineID: int64(threadId)}, targetId, nil)
 	if err != nil {
 		s.config.log.Errorf("Error switching goroutines while stepping: %v", err)
 		// If we encounter an error, we will have to send a stopped event
@@ -2076,7 +2097,7 @@ func (s *Session) stepUntilStopAndNotify(command string, threadId int, granulari
 			command = api.StepInstruction
 		}
 	}
-	s.runUntilStopAndNotify(command, allowNextStateChange)
+	s.runUntilStopAndNotify(command, targetId, allowNextStateChange)
 }
 
 // onPauseRequest handles 'pause' request.
@@ -3004,7 +3025,7 @@ func (s *Session) onRestartRequest(request *dap.RestartRequest) {
 // This is an optional request enabled by capability 'supportsStepBackRequest'.
 func (s *Session) onStepBackRequest(request *dap.StepBackRequest, allowNextStateChange *syncflag) {
 	s.sendStepResponse(request.Arguments.ThreadId, &dap.StepBackResponse{Response: *newResponse(request.Request)})
-	s.stepUntilStopAndNotify(api.ReverseNext, request.Arguments.ThreadId, request.Arguments.Granularity, allowNextStateChange)
+	s.stepUntilStopAndNotify(api.ReverseNext, request.Arguments.ThreadId, request.Arguments.Granularity, 0, allowNextStateChange)
 }
 
 // onReverseContinueRequest performs a rewind command call up to the previous
@@ -3014,7 +3035,7 @@ func (s *Session) onReverseContinueRequest(request *dap.ReverseContinueRequest, 
 	s.send(&dap.ReverseContinueResponse{
 		Response: *newResponse(request.Request),
 	})
-	s.runUntilStopAndNotify(api.Rewind, allowNextStateChange)
+	s.runUntilStopAndNotify(api.Rewind, 0, allowNextStateChange)
 }
 
 // computeEvaluateName finds the named child, and computes its evaluate name.
@@ -3625,7 +3646,7 @@ func (s *Session) checkHaltRequested() bool {
 
 // resumeOnce is a helper function to resume the execution
 // of the target when the program is halted.
-func (s *Session) resumeOnce(command string, allowNextStateChange *syncflag) (bool, *api.DebuggerState, error) {
+func (s *Session) resumeOnce(command string, targetId int, allowNextStateChange *syncflag) (bool, *api.DebuggerState, error) {
 	// No other goroutines should be able to try to resume
 	// or halt execution while this goroutine is resuming
 	// execution, so we do not miss those events.
@@ -3645,7 +3666,7 @@ func (s *Session) resumeOnce(command string, allowNextStateChange *syncflag) (bo
 		state, err := s.debugger.State(false)
 		return false, state, err
 	}
-	state, err := s.debugger.Command(&api.DebuggerCommand{Name: command}, asyncSetupDone)
+	state, err := s.debugger.CommandWithTarget(&api.DebuggerCommand{Name: command}, targetId, asyncSetupDone)
 	return true, state, err
 }
 
@@ -3655,8 +3676,8 @@ func (s *Session) resumeOnce(command string, allowNextStateChange *syncflag) (bo
 // a channel that will be closed to signal that an
 // asynchronous command has completed setup or was interrupted
 // due to an error, so the server is ready to receive new requests.
-func (s *Session) runUntilStopAndNotify(command string, allowNextStateChange *syncflag) {
-	state, err := s.runUntilStop(command, allowNextStateChange)
+func (s *Session) runUntilStopAndNotify(command string, targetId int, allowNextStateChange *syncflag) {
+	state, err := s.runUntilStop(command, targetId, allowNextStateChange)
 
 	if s.conn.isClosed() {
 		s.config.log.Debugf("connection %d closed - stopping %q command", s.id, command)
@@ -3766,7 +3787,7 @@ func (s *Session) runUntilStopAndNotify(command string, allowNextStateChange *sy
 	}
 }
 
-func (s *Session) runUntilStop(command string, allowNextStateChange *syncflag) (*api.DebuggerState, error) {
+func (s *Session) runUntilStop(command string, targetId int, allowNextStateChange *syncflag) (*api.DebuggerState, error) {
 	// Clear any manual stop requests that came in before we started running.
 	s.setHaltRequested(false)
 
@@ -3776,19 +3797,19 @@ func (s *Session) runUntilStop(command string, allowNextStateChange *syncflag) (
 	var state *api.DebuggerState
 	var err error
 	for s.isRunningCmd() {
-		state, err = resumeOnceAndCheckStop(s, command, allowNextStateChange)
+		state, err = resumeOnceAndCheckStop(s, command, targetId, allowNextStateChange)
 		command = api.DirectionCongruentContinue
 	}
 	return state, err
 }
 
 // Make this a var, so it can be stubbed in testing.
-var resumeOnceAndCheckStop = func(s *Session, command string, allowNextStateChange *syncflag) (*api.DebuggerState, error) {
-	return s.resumeOnceAndCheckStop(command, allowNextStateChange)
+var resumeOnceAndCheckStop = func(s *Session, command string, targetId int, allowNextStateChange *syncflag) (*api.DebuggerState, error) {
+	return s.resumeOnceAndCheckStop(command, targetId, allowNextStateChange)
 }
 
-func (s *Session) resumeOnceAndCheckStop(command string, allowNextStateChange *syncflag) (*api.DebuggerState, error) {
-	resumed, state, err := s.resumeOnce(command, allowNextStateChange)
+func (s *Session) resumeOnceAndCheckStop(command string, targetId int, allowNextStateChange *syncflag) (*api.DebuggerState, error) {
+	resumed, state, err := s.resumeOnce(command, targetId, allowNextStateChange)
 	// We should not try to process the log points if the program was not
 	// resumed or there was an error.
 	if !resumed || processExited(state, err) || state == nil || err != nil || s.conn.isClosed() {

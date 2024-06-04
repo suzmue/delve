@@ -40,7 +40,7 @@ func (grp *TargetGroup) Next() (err error) {
 		return fmt.Errorf("next while nexting")
 	}
 
-	if err = next(grp.Selected, false, false); err != nil {
+	if err = next(grp.Selected, false, false, 0); err != nil {
 		grp.Selected.ClearSteppingBreakpoints()
 		return
 	}
@@ -442,6 +442,10 @@ func stepInstructionOut(grp *TargetGroup, dbp *Target, curthread Thread, fnname1
 // Step resumes the processes in the group, continuing the selected target
 // until the next source line. Will step into functions.
 func (grp *TargetGroup) Step() (err error) {
+	return grp.StepWithTarget(0)
+}
+
+func (grp *TargetGroup) StepWithTarget(target int) (err error) {
 	if _, err := grp.Valid(); err != nil {
 		return err
 	}
@@ -449,7 +453,7 @@ func (grp *TargetGroup) Step() (err error) {
 		return fmt.Errorf("next while nexting")
 	}
 
-	if err = next(grp.Selected, true, false); err != nil {
+	if err = next(grp.Selected, true, false, target); err != nil {
 		_ = grp.Selected.ClearSteppingBreakpoints()
 		return err
 	}
@@ -460,6 +464,13 @@ func (grp *TargetGroup) Step() (err error) {
 	}
 
 	return grp.Continue()
+}
+
+func (grp *TargetGroup) StepInTargets() []AsmInstruction {
+	if _, err := grp.Valid(); err != nil {
+		return nil
+	}
+	return stepInTargets(grp.Selected)
 }
 
 // sameGoroutineCondition returns an expression that evaluates to true when
@@ -516,7 +527,7 @@ func (grp *TargetGroup) StepOut() error {
 	}()
 
 	if topframe.Inlined {
-		if err := next(dbp, false, true); err != nil {
+		if err := next(dbp, false, true, 0); err != nil {
 			return err
 		}
 
@@ -641,7 +652,7 @@ func (grp *TargetGroup) StepInstruction(skipCalls bool) (err error) {
 // for an inlined function call. Everything works the same as normal except
 // when removing instructions belonging to inlined calls we also remove all
 // instructions belonging to the current inlined call.
-func next(dbp *Target, stepInto, inlinedStepOut bool) error {
+func next(dbp *Target, stepInto, inlinedStepOut bool, target int) error {
 	backward := dbp.recman.GetDirection() == Backward
 	selg := dbp.SelectedGoroutine()
 	curthread := dbp.CurrentThread()
@@ -713,7 +724,7 @@ func next(dbp *Target, stepInto, inlinedStepOut bool) error {
 	sameFrameCond := astutil.And(sameGCond, frameoffCondition(&topframe))
 
 	if stepInto && !backward {
-		err := setStepIntoBreakpoints(dbp, topframe.Current.Fn, text, topframe, sameGCond)
+		err := setStepIntoBreakpoints(dbp, topframe.Current.Fn, text, topframe, sameGCond, target)
 		if err != nil {
 			return err
 		}
@@ -812,10 +823,54 @@ func next(dbp *Target, stepInto, inlinedStepOut bool) error {
 	return nil
 }
 
-func setStepIntoBreakpoints(dbp *Target, curfn *Function, text []AsmInstruction, topframe Stackframe, sameGCond ast.Expr) error {
+func stepInTargets(dbp *Target) []AsmInstruction {
+	backward := dbp.recman.GetDirection() == Backward
+	selg := dbp.SelectedGoroutine()
+	curthread := dbp.CurrentThread()
+	topframe, retframe, err := topframe(dbp, selg, curthread)
+	if err != nil {
+		return nil
+	}
+
+	if topframe.Current.Fn == nil {
+		return nil
+	}
+
+	if backward && retframe.Current.Fn == nil {
+		return nil
+	}
+
+	var regs Registers
+	if selg != nil && selg.Thread != nil {
+		regs, err = selg.Thread.Registers()
+		if err != nil {
+			return nil
+		}
+	}
+
+	text, err := disassemble(dbp.Memory(), regs, dbp.Breakpoints(), dbp.BinInfo(), topframe.Current.Fn.Entry, topframe.Current.Fn.End, false)
+	if err != nil {
+		return nil
+	}
+
+	var targets []AsmInstruction
+
+	for _, instr := range text {
+		if instr.Loc.File != topframe.Current.File || instr.Loc.Line != topframe.Current.Line || !instr.IsCall() || instr.DestLoc == nil {
+			continue
+		}
+		targets = append(targets, instr)
+	}
+	return targets
+}
+
+func setStepIntoBreakpoints(dbp *Target, curfn *Function, text []AsmInstruction, topframe Stackframe, sameGCond ast.Expr, target int) error {
 	gostmt := false
 	for _, instr := range text {
 		if instr.Loc.File != topframe.Current.File || instr.Loc.Line != topframe.Current.Line || !instr.IsCall() {
+			continue
+		}
+		if target != 0 && target != int(instr.Loc.PC) {
 			continue
 		}
 

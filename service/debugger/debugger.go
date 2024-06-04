@@ -1160,6 +1160,10 @@ func (d *Debugger) IsRunning() bool {
 
 // Command handles commands which control the debugger lifecycle
 func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struct{}) (*api.DebuggerState, error) {
+	return d.CommandWithTarget(command, 0, resumeNotify)
+}
+
+func (d *Debugger) CommandWithTarget(command *api.DebuggerCommand, targetId int, resumeNotify chan struct{}) (*api.DebuggerState, error) {
 	var err error
 
 	if command.Name == api.Halt {
@@ -1242,7 +1246,7 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
 		if err := d.target.ChangeDirection(proc.Forward); err != nil {
 			return nil, err
 		}
-		err = d.target.Step()
+		err = d.target.StepWithTarget(targetId)
 	case api.ReverseStep:
 		d.log.Debug("reverse stepping")
 		if err := d.target.ChangeDirection(proc.Backward); err != nil {
@@ -1339,6 +1343,10 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
 		d.amendBreakpoint(bp)
 	}
 	return state, err
+}
+
+func (d *Debugger) StepInTargets() []proc.AsmInstruction {
+	return d.target.StepInTargets()
 }
 
 func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread proc.Thread) error {
